@@ -131,18 +131,32 @@ async function runAgentPipeline(provider, key, model, p) {
   const evaluatorSystem = "You are a strict quality reviewer for image/video prompts. Evaluate the supplied draft against the user's request. Do not rewrite the prompt yet. Return ONLY valid JSON with schema: {\"scores\":{\"Clarity\":1,\"Completeness\":1,\"Tool Compatibility\":1,\"Specificity\":1,\"Creativity\":1},\"average_score\":1,\"issues\":[\"specific issue\"],\"must_improve\":true,\"evaluation_text\":\"brief explanation in the requested explanation language\"}. Scores are integers from 1 to 10. Penalize missing requested details, vague wording, unsupported parameters, and incompatibility with the selected tool. A score of 8+ requires a usable, specific, complete prompt.";
   const evaluatorUser = "USER REQUIREMENTS:\n" + base + "\n\nDRAFT TO REVIEW:\n" + JSON.stringify(data) + "\n\nEvaluate only against these requirements.";
   let review = null;
+  let reviewMode = "model";
   try {
     review = parseAgentJson(await callProvider(provider, key, model, evaluatorSystem, evaluatorUser));
-    trace.push({ step: "independent_review", status: "completed" });
+    const required = ["Clarity", "Completeness", "Tool Compatibility", "Specificity", "Creativity"];
+    if (!review.scores || required.some(k => !Number.isFinite(Number(review.scores[k])))) throw new Error("مراجعة النموذج لم تتضمن درجات صالحة لكل المعايير.");
+    review.scores = Object.fromEntries(required.map(k => [k, Math.max(1, Math.min(10, Math.round(Number(review.scores[k]))))]));
+    review.average_score = Number((required.reduce((sum, k) => sum + review.scores[k], 0) / required.length).toFixed(1));
+    review.issues = Array.isArray(review.issues) ? review.issues.filter(x => typeof x === "string") : [];
+    review.must_improve = review.must_improve === true || review.average_score < 8 || review.issues.length > 0;
+    trace.push({ step: "independent_review", status: "completed", mode: "model", score: review.average_score, issues_count: review.issues.length });
   } catch (e) {
-    trace.push({ step: "independent_review", status: "unavailable", reason: String(e.message || e).slice(0, 180) });
+    reviewMode = "fallback";
+    const promptText = String(data.final_prompt || "");
+    const checks = [
+      { ok: promptText.trim().length >= 120, issue: "البرومبت قصير وقد يحتاج تفاصيل إضافية." },
+      { ok: /lighting|composition|texture|camera|background|material|color|mood/i.test(promptText), issue: "قد يحتاج البرومبت إلى تفاصيل بصرية أكثر تحديدًا." },
+      { ok: promptText.includes(String(p.ratio || "")) || /--ar\\s+\\d+:\\d+|aspect ratio/i.test(promptText), issue: "لم يُعثر بوضوح على نسبة الأبعاد المطلوبة." }
+    ];
+    const issues = checks.filter(x => !x.ok).map(x => x.issue);
+    const score = Math.max(5, Math.min(8, 10 - issues.length));
+    review = { scores: { Clarity: score, Completeness: score, "Tool Compatibility": score, Specificity: score, Creativity: score }, average_score: score, issues, must_improve: issues.length > 0, evaluation_text: "تعذرت المراجعة المستقلة بواسطة النموذج؛ أُجري فحص احتياطي آلي محدود. " + (issues.length ? "ملاحظات: " + issues.join(" ") : "لم تُكتشف مشكلات بنيوية أساسية.") };
+    trace.push({ step: "independent_review", status: "fallback", mode: "deterministic_checks", reason: String(e.message || e).slice(0, 220), score, issues_count: issues.length });
   }
-
-  if (review && review.scores) {
-    data.scores = review.scores;
-    data.average_score = Number(review.average_score) || 0;
-    data.evaluation_text = review.evaluation_text || data.evaluation_text || "";
-  }
+  data.scores = review.scores;
+  data.average_score = review.average_score;
+  data.evaluation_text = review.evaluation_text || data.evaluation_text || "";
   const needsRevision = review && (review.must_improve === true ||
     Number(review.average_score) < 8 ||
     (Array.isArray(review.issues) && review.issues.length > 0));
@@ -153,9 +167,9 @@ async function runAgentPipeline(provider, key, model, p) {
     try {
       const revised = normalizeResult(parseAgentJson(await callProvider(provider, key, model, revisionSystem, revisionUser)));
       data = { ...data, ...revised };
-      trace.push({ step: "revision", status: "completed" });
+      trace.push({ step: "revision", status: "completed", score_before: review.average_score, score_after: revised.average_score });
     } catch (e) {
-      trace.push({ step: "revision", status: "failed", reason: String(e.message || e).slice(0, 180) });
+      trace.push({ step: "revision", status: "failed", reason: String(e.message || e).slice(0, 220) });
     }
   } else {
     trace.push({ step: "revision", status: "not_needed" });
@@ -167,6 +181,7 @@ async function runAgentPipeline(provider, key, model, p) {
   data.agent = {
     version: "2.0",
     mode: "bounded-review-and-revision",
+    review_mode: reviewMode,
     steps: trace,
     elapsed_ms: Date.now() - startedAt,
     max_revision_passes: 1
