@@ -120,6 +120,41 @@ function normalizeResult(data) {
   return data;
 }
 
+function auditFinalPrompt(prompt, p, plan) {
+  const text = String(prompt || "");
+  const lower = text.toLowerCase();
+  const checks = [];
+  const add = (name, ok, message, evidence = "") => checks.push({ name, ok: Boolean(ok), message: ok ? "" : message, evidence });
+  add("non_empty_prompt", text.trim().length >= 20, "البرومبت النهائي فارغ أو قصير جدًا.", text.trim().length + " حرفًا");
+  const ratio = String(p.ratio || "").trim();
+  if (ratio) {
+    const ratioOk = lower.includes(ratio.toLowerCase()) || new RegExp("--ar\\s+" + ratio.replace(":", "\\s*:\\s*")).test(text) ||
+      /aspect ratio/i.test(text) || (ratio === "9:16" && /vertical|portrait/i.test(text));
+    add("requested_aspect_ratio", ratioOk, "لم يظهر دليل كافٍ على نسبة الأبعاد المطلوبة: " + ratio, ratioOk ? "عُثر على النسبة أو وصف اتجاه متوافق." : "لم يُعثر على النسبة أو وصف اتجاه متوافق.");
+  }
+  const target = String(p.target || "");
+  if (/midjourney/i.test(target)) {
+    add("midjourney_invalid_style_parameter", !/--style\\s+cinematic\\b/i.test(text), "معامل --style cinematic قد لا يكون صالحًا؛ اجعل cinematic وصفًا نصيًا.", "فحص صيغة معامل Midjourney.");
+  }
+  const required = Array.isArray(plan?.required_elements) ? plan.required_elements : [];
+  const requirementResults = required.slice(0, 15).map((item) => {
+    const phrase = String(item || "").trim();
+    const words = phrase.toLowerCase().split(/[^a-z0-9\\u0600-\\u06ff]+/).filter(w => w.length >= 4);
+    const matchedWords = words.filter(w => lower.includes(w));
+    const ratioMatched = words.length ? matchedWords.length / words.length : lower.includes(phrase.toLowerCase());
+    const ok = ratioMatched >= 0.5 || lower.includes(phrase.toLowerCase());
+    return { requirement: phrase, ok, evidence: matchedWords.length ? "تطابق نصي: " + matchedWords.slice(0, 6).join(", ") : "لم يُعثر على تطابق نصي واضح.", confidence: words.length ? Number(ratioMatched.toFixed(2)) : (ok ? 1 : 0) };
+  });
+  for (const r of requirementResults) add("planned_requirement", r.ok, "قد يكون أحد متطلبات الخطة مفقودًا: " + r.requirement, r.evidence);
+  const notes = String(p.notes || "");
+  const explicitNegatives = [];
+  if (/no text|without text|no lettering/i.test(notes)) explicitNegatives.push({ name: "no_text_constraint", regex: /no text|without text|no lettering/i });
+  if (/no watermark|without watermark/i.test(notes)) explicitNegatives.push({ name: "no_watermark_constraint", regex: /no watermark|without watermark/i });
+  for (const item of explicitNegatives) add(item.name, item.regex.test(text), "لم يتم الحفاظ بوضوح على القيد: " + item.name, "تم فحص القيد النصي الصريح.");
+  const issues = checks.filter(x => !x.ok);
+  return { passed: issues.length === 0, checks, issues: issues.map(x => x.message), requirement_results: requirementResults, checked_at: new Date().toISOString() };
+}
+
 function runLocalPromptTools(prompt, p) {
   const text = String(prompt || "");
   const target = String(p.target || "");
@@ -318,17 +353,34 @@ async function runAgentPipeline(provider, key, model, p) {
     trace.push({ step: "decision_audit", status: "fallback_warning", tool: "deterministic_audit_fallback", reason: String(e.message || e).slice(0, 220), decisions_reviewed: localDecisions.length, potential_violations: localViolations.length });
   }
 
-  trace.push({ step: "tool_validation", status: validation.passed ? "completed" : "warning", tool: validation.tool, checks: validation.checks, issues: validation.issues });
+  // Final deterministic gate: independently re-check the actual final text, not model claims.
+  const finalAudit = auditFinalPrompt(data.final_prompt, p, plan);
+  const existingAuditIssues = Array.isArray(decisionAudit.potential_violations) ? decisionAudit.potential_violations.slice() : [];
+  const finalAuditIssues = finalAudit.issues.filter(Boolean);
+  const mergedViolations = [...new Set([...existingAuditIssues, ...finalAuditIssues])];
+  const unresolvedFinalRequirements = finalAudit.requirement_results.filter(x => !x.ok);
+  if (mergedViolations.length || unresolvedFinalRequirements.length || !finalAudit.passed) {
+    if (decisionAudit.status === "pass") decisionAudit.status = unresolvedFinalRequirements.length ? "warning" : "fail";
+    decisionAudit.potential_violations = mergedViolations;
+    decisionAudit.summary = (decisionAudit.summary || "اكتمل التدقيق.") + " فحص المطابقة النهائي: " +
+      (finalAudit.passed ? "اجتاز الفحوص البرمجية المستقلة." : "اكتُشفت نقاط تحتاج إلى مراجعة.");
+  }
+  decisionAudit.final_checks = finalAudit.checks;
+  decisionAudit.requirement_results = finalAudit.requirement_results;
+  decisionAudit.final_check_passed = finalAudit.passed;
+  // One authoritative status per stage: no UI badge may imply success when final checks failed.
+  trace.push({ step: "final_audit_gate", status: finalAudit.passed ? "completed" : "warning", tool: "deterministic_final_audit", checks_passed: finalAudit.checks.filter(x => x.ok).length, checks_total: finalAudit.checks.length, issues: finalAudit.issues });
+  trace.push({ step: "tool_validation", status: validation.passed && finalAudit.passed ? "completed" : "warning", tool: validation.tool, checks: validation.checks, issues: [...validation.issues, ...finalAudit.issues] });
   if (typeof data.final_prompt !== "string" || data.final_prompt.trim().length < 20) throw new Error("لم ينتج الوكيل برومبت نهائيًا صالحًا.");
   data.scores = review.scores || data.scores;
   data.average_score = Number((Object.values(data.scores).reduce((s,v)=>s+Number(v),0)/5).toFixed(1));
   data.evaluation_text = (review.evaluation_text || data.evaluation_text || "") + (validation.issues.length ? "\n\nنتائج الفحص البرمجي: " + validation.issues.join(" ") : "\n\nاجتاز البرومبت الفحوص البرمجية المحددة.");
   data.agent = {
-    version: "3.0",
-    mode: "plan-tool-review-revision",
+    version: "4.0",
+    mode: "plan-review-revise-independent-audit-final-gate",
     review_mode: reviewMode,
     plan,
-    tool_validation: validation,
+    tool_validation: { ...validation, passed: validation.passed && finalAudit.passed, final_audit: finalAudit },
     decision_audit: decisionAudit,
     steps: trace,
     elapsed_ms: Date.now() - startedAt,
