@@ -263,15 +263,37 @@ async function runAgentPipeline(provider, key, model, p) {
   let decisionAudit = { status: "unavailable", summary: "تعذر إكمال التدقيق المستقل؛ الفحوص المحلية متاحة بشكل منفصل.", preserved_requirements: [], potential_violations: [], decisions_reviewed: [], uncertainty: ["لم يكتمل تدقيق النموذج المستقل."] };
   try {
     const auditSystem = 'You are an independent quality auditor. Compare USER REQUEST, PLAN, and FINAL PROMPT. Return ONLY valid JSON: {"status":"pass|warning|fail","summary":"string","preserved_requirements":["string"],"potential_violations":["string"],"decisions_reviewed":[{"decision":"string","evidence":"string","verdict":"supported|uncertain|conflict","reason":"string"}],"uncertainty":["string"]}. Identify omissions, contradictions, and unjustified changes. Distinguish verifiable text facts from subjective design judgments. Never claim the image was generated or visually checked.';
-    const auditUser = "USER REQUEST:\\n" + base + "\\nPLAN:\\n" + JSON.stringify(plan) + "\\nFINAL PROMPT:\\n" + String(data.final_prompt || "") + "\\nLOCAL VALIDATION:\\n" + JSON.stringify(validation);
+    const auditUser = "USER REQUEST:\n" + base + "\nPLAN:\n" + JSON.stringify(plan) + "\nFINAL PROMPT:\n" + String(data.final_prompt || "") + "\nLOCAL VALIDATION:\n" + JSON.stringify(validation);
     const a = parseAgentJson(await callProvider(provider, key, model, auditSystem, auditUser));
     if (!a || !Array.isArray(a.potential_violations) || !Array.isArray(a.decisions_reviewed)) throw new Error("تقرير التدقيق غير مكتمل.");
     decisionAudit = { status: ["pass","warning","fail"].includes(a.status) ? a.status : "warning", summary: String(a.summary || "اكتمل التدقيق."), preserved_requirements: Array.isArray(a.preserved_requirements) ? a.preserved_requirements : [], potential_violations: a.potential_violations, decisions_reviewed: a.decisions_reviewed, uncertainty: Array.isArray(a.uncertainty) ? a.uncertainty : [] };
     trace.push({ step: "decision_audit", status: decisionAudit.status === "pass" ? "completed" : "warning", tool: "independent_llm_audit", summary: decisionAudit.summary, violations: decisionAudit.potential_violations.length, decisions_reviewed: decisionAudit.decisions_reviewed.length });
   } catch (e) {
-    decisionAudit.summary = "تعذر التدقيق المستقل: " + String(e.message || e).slice(0, 180);
-    decisionAudit.uncertainty = [decisionAudit.summary];
-    trace.push({ step: "decision_audit", status: "unavailable", tool: "independent_llm_audit", reason: String(e.message || e).slice(0, 220) });
+    // Honest deterministic fallback: concrete local evidence, never label it an independent model audit.
+    const promptText = String(data.final_prompt || "").toLowerCase();
+    const localDecisions = [];
+    const localViolations = [];
+    const ratio = String(p.ratio || "");
+    const ratioOk = !ratio || promptText.includes(ratio.toLowerCase()) || /aspect ratio/i.test(promptText) || (ratio === "9:16" && /vertical|portrait/i.test(promptText));
+    localDecisions.push({ decision: "تضمين نسبة الأبعاد المطلوبة", evidence: ratio ? "النسبة المطلوبة: " + ratio : "لم يحدد المستخدم نسبة أبعاد.", verdict: ratioOk ? "supported" : "conflict", reason: ratioOk ? "وجدت إشارة نصية متوافقة مع النسبة أو الوصف العمودي." : "لم يُعثر على النسبة المطلوبة أو وصف بديل واضح." });
+    if (!ratioOk) localViolations.push("قد تكون نسبة الأبعاد المطلوبة مفقودة من البرومبت.");
+    const requirements = Array.isArray(plan.required_elements) ? plan.required_elements : [];
+    const preserved = [];
+    for (const item of requirements.slice(0, 12)) {
+      const words = String(item).toLowerCase().split(/[^a-z0-9\u0600-\u06ff]+/).filter(w => w.length > 3);
+      const matched = words.length > 0 && words.some(w => promptText.includes(w));
+      (matched ? preserved : localViolations).push(String(item));
+      localDecisions.push({ decision: "متطلب من خطة الوكيل: " + String(item), evidence: matched ? "عُثر على كلمة أو عبارة مرتبطة بالمتطلب في البرومبت." : "لم يُعثر على تطابق نصي واضح.", verdict: matched ? "supported" : "uncertain", reason: "هذا فحص نصي تقريبي وليس فهمًا دلاليًا كاملًا." });
+    }
+    decisionAudit = {
+      status: "warning",
+      summary: "تعذّر تدقيق نموذج مستقل؛ عُرض بديل برمجي محدود. لا يُعدّ هذا اجتيازًا للتدقيق المستقل.",
+      preserved_requirements: preserved,
+      potential_violations: localViolations,
+      decisions_reviewed: localDecisions,
+      uncertainty: ["فشل التدقيق المستقل: " + String(e.message || e).slice(0, 180), "الفحص المحلي تقريبي وقد يفوّت المعنى أو المرادفات؛ يلزم إعادة المحاولة للتحقق المستقل."]
+    };
+    trace.push({ step: "decision_audit", status: "fallback_warning", tool: "deterministic_audit_fallback", reason: String(e.message || e).slice(0, 220), decisions_reviewed: localDecisions.length, potential_violations: localViolations.length });
   }
 
   trace.push({ step: "tool_validation", status: validation.passed ? "completed" : "warning", tool: validation.tool, checks: validation.checks, issues: validation.issues });
