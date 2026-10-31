@@ -131,10 +131,14 @@ async function callProvider(provider, key, model, sys, user, maxTokens = 1200) {
 }
 function parseAgentJson(raw) {
   if (raw && typeof raw === "object") return raw;
-  const source = String(raw || "").replace(/^\\uFEFF/, "").trim();
+  const source = String(raw || "").replace(new RegExp("^\\uFEFF"), "").trim();
   const candidates = [source];
-  const fenced = source.match(/```(?:json)?\\s*([\\s\\S]*?)\\s*```/i);
-  if (fenced) candidates.push(fenced[1].trim());
+  const fenceStart = source.indexOf("```");
+  if (fenceStart >= 0) {
+    const firstLineEnd = source.indexOf("\n", fenceStart);
+    const fenceEnd = source.indexOf("```", firstLineEnd + 1);
+    if (firstLineEnd >= 0 && fenceEnd > firstLineEnd) candidates.push(source.slice(firstLineEnd + 1, fenceEnd).trim());
+  }
   const first = source.indexOf("{");
   const last = source.lastIndexOf("}");
   if (first >= 0 && last > first) candidates.push(source.slice(first, last + 1));
