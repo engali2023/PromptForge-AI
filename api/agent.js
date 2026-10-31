@@ -75,7 +75,7 @@ async function getFreeCatalog(apiKeys = {}, options = {}) {
       const r = await fetch("https://generativelanguage.googleapis.com/v1beta/models", { headers: { Accept: "application/json", "x-goog-api-key": apiKeys.gemini.trim() }, signal: AbortSignal.timeout(9000) });
       if (r.ok) {
         const body = await r.json();
-        const available = new Set((body.models || []).filter(m => Array.isArray(m.supportedGenerationMethods) && m.supportedGenerationMethods.includes("generateContent")).map(m => String(m.name || "").replace(/^models\\//, "")));
+        const available = new Set((body.models || []).filter(m => Array.isArray(m.supportedGenerationMethods) && m.supportedGenerationMethods.includes("generateContent")).map(m => String(m.name || "").replace(/^models\//, "")));
         result.gemini = GEMINI_FREE_MODELS.filter(m => available.has(m.id)).map(m => ({ ...m, verifiedFree: true }));
         if (!result.gemini.length) result.notes.gemini = "لم يُرجع مفتاحك أي نموذج من قائمة Gemini المجانية المعتمدة. تحقق من أهلية الخطة المجانية والموديلات المتاحة في AI Studio.";
       } else {
