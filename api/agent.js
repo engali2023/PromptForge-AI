@@ -85,14 +85,14 @@ async function getFreeCatalog(apiKeys = {}, options = {}) {
   if (useCache) catalogCache = { at: Date.now(), data: result };
   return result;
 }
-async function callProvider(provider, key, model, sys, user) {
+async function callProvider(provider, key, model, sys, user, maxTokens = 1200) {
   const cfg = PROVIDERS[provider];
   if (!cfg) throw new Error(`مزود غير مدعوم: ${provider}`);
   const headers = { Authorization: `Bearer ${key}`, "Content-Type": "application/json" };
   if (provider === "openrouter") { headers["HTTP-Referer"] = process.env.APP_URL || "https://vercel.app"; headers["X-Title"] = "PromptForge AI"; }
   let body;
-  if (provider === "cohere") body = { model, messages: [{ role: "system", content: sys }, { role: "user", content: user }], temperature: 0.6, max_tokens: 3500 };
-  else body = { model, messages: [{ role: "system", content: sys }, { role: "user", content: user }], temperature: 0.6, max_tokens: 3500, stream: false };
+  if (provider === "cohere") body = { model, messages: [{ role: "system", content: sys }, { role: "user", content: user }], temperature: 0.6, max_tokens: maxTokens };
+  else body = { model, messages: [{ role: "system", content: sys }, { role: "user", content: user }], temperature: 0.6, max_tokens: maxTokens, stream: false };
   const response = await fetch(cfg.url, { method: "POST", headers, body: JSON.stringify(body), signal: AbortSignal.timeout(9000) });
   const raw = await response.text();
   if (!response.ok) {
@@ -183,7 +183,7 @@ async function runAgentPipeline(provider, key, model, p) {
   const planSystem = "You are the planning component of PromptForge. Convert the user's creative request into a concise actionable plan. Return ONLY valid JSON: {\"goal\":\"...\",\"required_elements\":[\"...\"],\"visual_strategy\":\"...\",\"tool_constraints\":[\"...\"],\"validation_criteria\":[\"...\"],\"risks_or_unknowns\":[\"...\"]}. Do not write the final prompt yet. Explanations must use the requested language.";
   let plan;
   try {
-    plan = parseAgentJson(await callProvider(provider, key, model, planSystem, base));
+    plan = parseAgentJson(await callProvider(provider, key, model, planSystem, base, 650));
     if (!plan || !Array.isArray(plan.required_elements) || !Array.isArray(plan.validation_criteria)) throw new Error("خطة غير مكتملة");
     trace.push({ step: "planning", status: "completed", tool: "llm_planner", details: plan });
   } catch (e) {
@@ -192,7 +192,7 @@ async function runAgentPipeline(provider, key, model, p) {
   }
 
   const generationSystem = systemPrompt() + "\n\nAGENT PLAN (follow this plan):\n" + JSON.stringify(plan) + "\n\nReturn valid JSON matching the required output schema. Preserve user constraints.";
-  const rawDraft = await callProvider(provider, key, model, generationSystem, base);
+  const rawDraft = await callProvider(provider, key, model, generationSystem, base, 1500);
   let data = normalizeResult(parseAgentJson(rawDraft));
   trace.push({ step: "draft", status: "completed", tool: "llm_generator" });
 
@@ -201,7 +201,7 @@ async function runAgentPipeline(provider, key, model, p) {
   let reviewMode = "model";
   let validation = runLocalPromptTools(data.final_prompt, p);
   try {
-    review = parseAgentJson(await callProvider(provider, key, model, evaluatorSystem, "USER REQUIREMENTS:\n" + base + "\nAGENT PLAN:\n" + JSON.stringify(plan) + "\nDRAFT:\n" + JSON.stringify(data)));
+    review = parseAgentJson(await callProvider(provider, key, model, evaluatorSystem, "USER REQUIREMENTS:\n" + base.slice(0, 4500) + "\nPLAN:\n" + JSON.stringify(plan).slice(0, 2500) + "\nDRAFT PROMPT:\n" + String(data.final_prompt || "").slice(0, 5000), 650));
     const required = ["Clarity", "Completeness", "Tool Compatibility", "Specificity", "Creativity"];
     if (!review.scores || required.some(k => !Number.isFinite(Number(review.scores[k])))) throw new Error("مراجعة النموذج لم تتضمن درجات صالحة.");
     review.scores = Object.fromEntries(required.map(k => [k, Math.max(1, Math.min(10, Math.round(Number(review.scores[k]))))]));
@@ -223,14 +223,14 @@ async function runAgentPipeline(provider, key, model, p) {
     validation = runLocalPromptTools(data.final_prompt, p);
     const issues = [...(review.issues || []), ...validation.issues];
     const reviewAverage = Number((Object.values(review.scores).reduce((s,v)=>s+Number(v),0)/5).toFixed(1));
-    if (!review.must_improve && validation.passed && reviewAverage >= 8) {
+    if (!review.must_improve && validation.passed && (reviewMode === "fallback" || reviewAverage >= 8)) {
       trace.push({ step: "revision", status: "not_needed", pass, reason: "review_and_tools_passed" });
       break;
     }
     const revisionSystem = "You are the revision component of a prompt-engineering agent. Fix the supplied issues using the user request, agent plan, and tool-validation report. Preserve all required constraints. Do not claim to have generated or tested media. Return ONLY valid JSON using the standard PromptForge result schema.";
     const revisionUser = "USER REQUEST:\n" + base + "\nPLAN:\n" + JSON.stringify(plan) + "\nCURRENT RESULT:\n" + JSON.stringify(data) + "\nREVIEW ISSUES:\n" + JSON.stringify(issues) + "\nLOCAL TOOL VALIDATION:\n" + JSON.stringify(validation) + "\nRevise pass " + pass + " of " + maxPasses + ".";
     try {
-      const revised = normalizeResult(parseAgentJson(await callProvider(provider, key, model, revisionSystem, revisionUser)));
+      const revised = normalizeResult(parseAgentJson(await callProvider(provider, key, model, revisionSystem, revisionUser.slice(0, 9000), 1000)));
       const previousPrompt = data.final_prompt;
       if (typeof revised.final_prompt !== "string" || revised.final_prompt.trim().length < 20) throw new Error("المراجعة لم تنتج برومبت صالحًا.");
       data = { ...data, ...revised, draft_prompt: data.draft_prompt || initialDraftPrompt };
@@ -242,12 +242,14 @@ async function runAgentPipeline(provider, key, model, p) {
       review = { ...review, must_improve: !validation.passed, issues: validation.issues };
     } catch (e) {
       const revisionError = String(e.message || e).slice(0, 220);
-      // One bounded retry with a smaller, simpler response contract.
+      // Avoid repeating the same request immediately after a rate-limit response.
       let retrySucceeded = false;
+      const rateLimited = /HTTP 429|rate limit|rate_limit|tokens per minute|TPM/i.test(revisionError);
       try {
+        if (rateLimited) throw new Error("تجاوز حد الاستخدام 429؛ تم إيقاف إعادة المحاولة لتجنب استهلاك الحصة، وسيُستخدم الإصلاح المحلي الآمن إن أمكن.");
         const retrySystem = "Edit the prompt only. Return ONLY JSON with one property: final_prompt (string). Preserve the user's requirements. Do not explain.";
         const retryUser = "Improve this prompt for " + String(p.target || "the selected tool") + " with aspect ratio " + String(p.ratio || "") + ". Fix these issues: " + JSON.stringify(issues) + "\nPROMPT:\n" + String(data.final_prompt || "");
-        const retryResult = parseAgentJson(await callProvider(provider, key, model, retrySystem, retryUser));
+        const retryResult = parseAgentJson(await callProvider(provider, key, model, retrySystem, retryUser.slice(0, 5000), 450));
         const retryPrompt = typeof retryResult.final_prompt === "string" ? retryResult.final_prompt : "";
         if (retryPrompt.trim().length >= 20) {
           const previousPrompt = String(data.final_prompt || "");
@@ -299,7 +301,7 @@ async function runAgentPipeline(provider, key, model, p) {
   try {
     const auditSystem = 'You are an independent quality auditor. Compare USER REQUEST, PLAN, and FINAL PROMPT. Return ONLY valid JSON: {"status":"pass|warning|fail","summary":"string","preserved_requirements":["string"],"potential_violations":["string"],"decisions_reviewed":[{"decision":"string","evidence":"string","verdict":"supported|uncertain|conflict","reason":"string"}],"uncertainty":["string"]}. Identify omissions, contradictions, and unjustified changes. Distinguish verifiable text facts from subjective design judgments. Never claim the image was generated or visually checked.';
     const auditUser = "USER REQUEST:\n" + base + "\nPLAN:\n" + JSON.stringify(plan) + "\nFINAL PROMPT:\n" + String(data.final_prompt || "") + "\nLOCAL VALIDATION:\n" + JSON.stringify(validation);
-    const a = parseAgentJson(await callProvider(provider, key, model, auditSystem, auditUser));
+    const a = parseAgentJson(await callProvider(provider, key, model, auditSystem, ("USER REQUEST:\n" + base.slice(0, 3500) + "\nPLAN:\n" + JSON.stringify(plan).slice(0, 1800) + "\nFINAL PROMPT:\n" + String(data.final_prompt || "").slice(0, 4500) + "\nLOCAL VALIDATION:\n" + JSON.stringify(validation).slice(0, 1200)), 650));
     if (!a || !Array.isArray(a.potential_violations) || !Array.isArray(a.decisions_reviewed)) throw new Error("تقرير التدقيق غير مكتمل.");
     const normalizedDecisions = a.decisions_reviewed.filter(x => x && typeof x === "object").map(x => ({
       decision: String(x.decision || "قرار غير مسمى"),
