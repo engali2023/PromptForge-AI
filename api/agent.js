@@ -281,10 +281,15 @@ async function runAgentPipeline(provider, key, model, p) {
     trace.push({ step: "independent_review", status: "fallback", tool: "local_checks_only", reason: String(e.message || e).slice(0, 180), issues_count: issues.length });
   }
 
-  const maxPasses = Math.max(0, Math.min(2, Number(p.maxRevisionPasses ?? 2) || 0));
+  const requestedPasses = Math.max(0, Math.min(2, Number(p.maxRevisionPasses ?? 2) || 0));
+  // Avoid repeated calls to a provider after it has explicitly rate-limited this request.
+  const maxPasses = providerRateLimited ? 0 : requestedPasses;
   let revisionPasses = 0;
   const revisionHistory = [];
   const initialDraftPrompt = String(data.final_prompt || "");
+  if (providerRateLimited && requestedPasses > 0) {
+    trace.push({ step: "revision", status: "skipped_rate_limit", tool: "local_validation_only", reason: "توقفنا عن إرسال طلبات إضافية إلى المزود بعد HTTP 429 لتجنب استهلاك الحصة وإعادة الفشل." });
+  }
   for (let pass = 1; pass <= maxPasses; pass++) {
     validation = runLocalPromptTools(data.final_prompt, p);
     const issues = [...(review.issues || []), ...validation.issues];
@@ -367,7 +372,7 @@ async function runAgentPipeline(provider, key, model, p) {
   // Independent decision audit: compare request, plan and final prompt.
   let decisionAudit = { status: "unavailable", summary: "تعذر إكمال التدقيق المستقل؛ الفحوص المحلية متاحة بشكل منفصل.", preserved_requirements: [], potential_violations: [], decisions_reviewed: [], uncertainty: ["لم يكتمل تدقيق النموذج المستقل."] };
   try {
-    if (providerRateLimited) throw new Error("تم تخطي التدقيق بالنموذج بسبب بلوغ حد TPM (HTTP 429). الفحص المحلي ليس تدقيقًا مستقلًا.");
+    if (providerRateLimited) throw new Error("تم إيقاف استدعاءات النموذج بعد HTTP 429؛ لم يُرسل طلب تدقيق إضافي حتى لا يتكرر استهلاك الحصة. الفحص المحلي ليس تدقيقًا مستقلًا.");
     const auditSystem = 'You are an independent quality auditor. Compare USER REQUEST, PLAN, and FINAL PROMPT. Return ONLY valid JSON: {"status":"pass|warning|fail","summary":"string","preserved_requirements":["string"],"potential_violations":["string"],"decisions_reviewed":[{"decision":"string","evidence":"string","verdict":"supported|uncertain|conflict","reason":"string"}],"uncertainty":["string"]}. Identify omissions, contradictions, and unjustified changes. Distinguish verifiable text facts from subjective design judgments. Never claim the image was generated or visually checked.';
     const auditUser = "USER REQUEST:\n" + base + "\nPLAN:\n" + JSON.stringify(plan) + "\nFINAL PROMPT:\n" + String(data.final_prompt || "") + "\nLOCAL VALIDATION:\n" + JSON.stringify(validation);
     const a = parseAgentJson(await callProvider(provider, key, model, auditSystem, ("USER REQUEST:\n" + base.slice(0, 3500) + "\nPLAN:\n" + JSON.stringify(plan).slice(0, 1800) + "\nFINAL PROMPT:\n" + String(data.final_prompt || "").slice(0, 4500) + "\nLOCAL VALIDATION:\n" + JSON.stringify(validation).slice(0, 1200)), 650));
@@ -442,6 +447,7 @@ async function runAgentPipeline(provider, key, model, p) {
   decisionAudit.final_check_passed = finalAudit.passed;
   // One authoritative status per stage: no UI badge may imply success when final checks failed.
   trace.push({ step: "final_audit_gate", status: finalAudit.passed ? "completed" : "warning", tool: "deterministic_final_audit", checks_passed: finalAudit.checks.filter(x => x.ok).length, checks_total: finalAudit.checks.length, issues: finalAudit.issues });
+  if (providerRateLimited) trace.push({ step: "provider_usage", status: "rate_limited", provider, model, reason: "توقف الوكيل عن استدعاءات النموذج الإضافية بعد HTTP 429؛ استُكملت الفحوص المحلية فقط." });
   trace.push({ step: "tool_validation", status: validation.passed && finalAudit.passed ? "completed" : "warning", tool: validation.tool, checks: validation.checks, issues: [...validation.issues, ...finalAudit.issues] });
   if (typeof data.final_prompt !== "string" || data.final_prompt.trim().length < 20) throw new Error("لم ينتج الوكيل برومبت نهائيًا صالحًا.");
   data.scores = review.scores || data.scores;
