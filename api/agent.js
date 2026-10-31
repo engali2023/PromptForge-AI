@@ -202,6 +202,29 @@ async function runAgentPipeline(provider, key, model, p) {
       trace.push({ step: "revision", status: "completed", pass, tool: "llm_revision", changed: data.final_prompt !== previousPrompt, validation_passed: validation.passed });
       review = { ...review, must_improve: !validation.passed, issues: validation.issues };
     } catch (e) {
+      const revisionError = String(e.message || e).slice(0, 220);
+      // One bounded retry with a smaller, simpler response contract.
+      let retrySucceeded = false;
+      try {
+        const retrySystem = "Edit the prompt only. Return ONLY JSON with one property: final_prompt (string). Preserve the user's requirements. Do not explain.";
+        const retryUser = "Improve this prompt for " + String(p.target || "the selected tool") + " with aspect ratio " + String(p.ratio || "") + ". Fix these issues: " + JSON.stringify(issues) + "\nPROMPT:\n" + String(data.final_prompt || "");
+        const retryResult = parseAgentJson(await callProvider(provider, key, model, retrySystem, retryUser));
+        const retryPrompt = typeof retryResult.final_prompt === "string" ? retryResult.final_prompt : "";
+        if (retryPrompt.trim().length >= 20) {
+          const previousPrompt = String(data.final_prompt || "");
+          data.final_prompt = retryPrompt.trim();
+          revisionPasses++;
+          validation = runLocalPromptTools(data.final_prompt, p);
+          trace.push({ step: "revision", status: "completed_retry", pass, tool: "llm_revision_retry", changed: data.final_prompt !== previousPrompt, validation_passed: validation.passed, first_error: revisionError });
+          review = { ...review, must_improve: !validation.passed, issues: validation.issues };
+          retrySucceeded = true;
+        } else {
+          throw new Error("إعادة المحاولة لم تُرجع final_prompt صالحًا.");
+        }
+      } catch (retryError) {
+        trace.push({ step: "revision_retry", status: "failed", pass, reason: String(retryError.message || retryError).slice(0, 220), first_error: revisionError });
+      }
+      if (retrySucceeded) continue;
       // Deterministic fallback: apply only safe, explainable text repairs when the revision model fails.
       const previousPrompt = String(data.final_prompt || "");
       let repairedPrompt = previousPrompt;
