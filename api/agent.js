@@ -168,7 +168,7 @@ function auditFinalPrompt(prompt, p, plan) {
   add("non_empty_prompt", text.trim().length >= 20, "البرومبت النهائي فارغ أو قصير جدًا.", text.trim().length + " حرفًا");
   const ratio = String(p.ratio || "").trim();
   if (ratio) {
-    const ratioOk = lower.includes(ratio.toLowerCase()) || new RegExp("--ar\\s+" + ratio.replace(":", "\\s*:\\s*")).test(text) ||
+    const ratioOk = lower.includes(ratio.toLowerCase()) || new RegExp("--ar\s+" + ratio.replace(":", "\\s*:\\s*")).test(text) ||
       /aspect ratio/i.test(text) || (ratio === "9:16" && /vertical|portrait/i.test(text));
     add("requested_aspect_ratio", ratioOk, "لم يظهر دليل كافٍ على نسبة الأبعاد المطلوبة: " + ratio, ratioOk ? "عُثر على النسبة أو وصف اتجاه متوافق." : "لم يُعثر على النسبة أو وصف اتجاه متوافق.");
   }
@@ -203,7 +203,7 @@ function runLocalPromptTools(prompt, p) {
   checks.push({ name: "non_empty_prompt", ok: text.trim().length >= 20, message: "البرومبت النهائي فارغ أو قصير جدًا." });
   checks.push({ name: "visual_specificity", ok: /lighting|composition|texture|camera|background|material|color|mood|lens|subject/i.test(text), message: "أضف تفاصيل بصرية مثل الإضاءة والتكوين والخامات." });
   if (ratio) {
-    const ratioMentioned = text.includes(ratio) || new RegExp("--ar\\s+" + ratio.replace(":", "\\s*:\\s*")).test(text) || /aspect ratio/i.test(text) || (ratio === "9:16" && /vertical|portrait/i.test(text)) || (ratio === "16:9" && /horizontal|landscape|widescreen/i.test(text));
+    const ratioMentioned = text.includes(ratio) || new RegExp("--ar\s+" + ratio.replace(":", "\\s*:\\s*")).test(text) || /aspect ratio/i.test(text) || (ratio === "9:16" && /vertical|portrait/i.test(text)) || (ratio === "16:9" && /horizontal|landscape|widescreen/i.test(text));
     checks.push({ name: "aspect_ratio", ok: ratioMentioned, message: "تحقق من تضمين نسبة الأبعاد المطلوبة: " + ratio });
   }
   if (/midjourney/i.test(target)) {
