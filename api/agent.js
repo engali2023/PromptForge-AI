@@ -7,10 +7,8 @@ const PROVIDERS = {
 };
 // Only models listed as free on Google’s official Gemini API pricing page are eligible for auto-free routing.
 const GEMINI_FREE_MODELS = [
-  { id: "gemini-3.8-flash", name: "Gemini 3.8 Flash (Free Tier)" },
-  { id: "gemini-3-flash-preview", name: "Gemini 3 Flash Preview (Free Tier)" },
-  { id: "gemini-2.5-flash", name: "Gemini 2.5 Flash (Free Tier)" },
-  { id: "gemini-2.5-flash-lite", name: "Gemini 2.5 Flash-Lite (Free Tier)" }
+  { id: "gemini-3.8-flash", name: "Gemini 3.8 Flash" },
+  { id: "gemini-3-flash-preview", name: "Gemini 3 Flash Preview" }
 ];
 let catalogCache = { at: 0, data: null };
 
@@ -116,7 +114,7 @@ async function callProvider(provider, key, model, sys, user, maxTokens = 1200) {
   if (provider === "openrouter") { headers["HTTP-Referer"] = process.env.APP_URL || "https://vercel.app"; headers["X-Title"] = "PromptForge AI"; }
   let body;
   if (provider === "cohere") body = { model, messages: [{ role: "system", content: sys }, { role: "user", content: user }], temperature: 0.6, max_tokens: maxTokens };
-  else body = { model, messages: [{ role: "system", content: sys }, { role: "user", content: user }], temperature: 0.4, max_tokens: Math.max(maxTokens, provider === "gemini" ? 2200 : maxTokens), stream: false, ...(provider === "gemini" ? { response_format: { type: "json_object" }, reasoning_effort: "minimal" } : {}) };
+  else body = { model, messages: [{ role: "system", content: sys }, { role: "user", content: user }], temperature: 0.4, max_tokens: Math.max(maxTokens, provider === "gemini" ? 2200 : maxTokens), stream: false, ...(provider === "gemini" ? { response_format: { type: "json_object" }, reasoning_effort: "low" } : {}) };
   const response = await fetch(cfg.url, { method: "POST", headers, body: JSON.stringify(body), signal: AbortSignal.timeout(18000) });
   const raw = await response.text();
   if (!response.ok) {
@@ -235,7 +233,7 @@ async function runAgentPipeline(provider, key, model, p) {
   }
 
   const generationSystem = systemPrompt() + "\n\nAGENT PLAN (follow this plan):\n" + JSON.stringify(plan) + "\n\nReturn valid JSON matching the required output schema. Preserve user constraints.";
-  if (providerRateLimited) throw new Error("Groq أو مزود النموذج تجاوز حد TPM (HTTP 429) أثناء التخطيط؛ اختر مزودًا آخر أو انتظر تجدد الحصة.");
+  if (providerRateLimited) throw new Error("تجاوز مزود النموذج حد الاستخدام (HTTP 429) أثناء التخطيط؛ انتظر تجدد الحصة أو استخدم مزودًا آخر.");
   const rawDraft = await callProvider(provider, key, model, generationSystem, base, 1500);
   let data = normalizeResult(parseAgentJson(rawDraft));
   trace.push({ step: "draft", status: "completed", tool: "llm_generator" });
@@ -501,13 +499,15 @@ async function tryAuto(p, action) {
       console.warn(JSON.stringify({ event: "promptforge_auto_fallback", provider: item.provider, model: item.model, error }));
     }
   }
-  const rateLimited = failures.some(f => /HTTP 429|rate limit|rate_limit|TPM/i.test(f.error));
+  const isRateLimited = f => /HTTP 429|rate limit|rate_limit|TPM/i.test(f.error);
+  const rateLimited = failures.some(isRateLimited);
+  const allRateLimited = failures.length > 0 && failures.every(isRateLimited);
   const unavailable = failures.some(f => /HTTP 503|HTTP 502|timeout|timed out|aborted/i.test(f.error));
-  const headline = rateLimited
-    ? "تجاوز أحد مزودي النماذج حد الاستخدام (429). جرّب بعد تجدد الحصة أو استخدم مزودًا آخر."
-    : unavailable
-      ? "النماذج المجانية التي جُرّبت غير متاحة مؤقتًا (مهلة/503). جرّب لاحقًا أو أضف مزودًا بديلًا."
-      : "تعذر تنفيذ الطلب عبر النماذج المؤهلة؛ راجع تفاصيل المزود أدناه.";
+  const headline = allRateLimited
+    ? "كل النماذج التي جُرّبت رفضت الطلب بسبب حد الاستخدام (429). انتظر تجدد الحصة أو أضف مزودًا آخر."
+    : unavailable && !rateLimited
+      ? "النماذج التي جُرّبت غير متاحة مؤقتًا (مهلة/503). جرّب لاحقًا أو أضف مزودًا بديلًا."
+      : "فشل بعض مزودي النماذج لأسباب مختلفة؛ راجع خطأ كل نموذج أدناه. أخطاء 400/404 تتطلب تعديل إعداد النموذج، أما 429 فتعني حد استخدام.";
   throw new Error(headline + " " + failures.map(f => `${f.provider}/${f.model}: ${f.error}`).join(" | ").slice(0, 1400));
 }
 export default async function handler(req, res) {
