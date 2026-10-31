@@ -202,8 +202,29 @@ async function runAgentPipeline(provider, key, model, p) {
       trace.push({ step: "revision", status: "completed", pass, tool: "llm_revision", changed: data.final_prompt !== previousPrompt, validation_passed: validation.passed });
       review = { ...review, must_improve: !validation.passed, issues: validation.issues };
     } catch (e) {
-      trace.push({ step: "revision", status: "failed", pass, reason: String(e.message || e).slice(0, 220) });
-      break;
+      // Deterministic fallback: apply only safe, explainable text repairs when the revision model fails.
+      const previousPrompt = String(data.final_prompt || "");
+      let repairedPrompt = previousPrompt;
+      const repairs = [];
+      if (/midjourney/i.test(String(p.target || "")) && /--style\\s+cinematic\\b/i.test(repairedPrompt)) {
+        repairedPrompt = repairedPrompt.replace(/--style\\s+cinematic\\b/ig, "cinematic");
+        repairs.push("استبدال معامل --style cinematic بوصف نصي");
+      }
+      const ratio = String(p.ratio || "");
+      if (ratio && !repairedPrompt.includes(ratio) && !/--ar\\s+\\d+:\\d+|aspect ratio/i.test(repairedPrompt)) {
+        repairedPrompt += /midjourney/i.test(String(p.target || "")) ? " --ar " + ratio : " Aspect ratio " + ratio + ".";
+        repairs.push("إضافة نسبة الأبعاد المطلوبة");
+      }
+      if (repairedPrompt.trim().length >= 20 && repairedPrompt !== previousPrompt) {
+        data.final_prompt = repairedPrompt;
+        validation = runLocalPromptTools(data.final_prompt, p);
+        revisionPasses++;
+        trace.push({ step: "revision", status: "completed_fallback", pass, tool: "deterministic_repair", changed: true, repairs, model_error: String(e.message || e).slice(0, 220), validation_passed: validation.passed });
+        review = { ...review, must_improve: !validation.passed, issues: validation.issues };
+      } else {
+        trace.push({ step: "revision", status: "failed", pass, tool: "llm_revision", reason: String(e.message || e).slice(0, 220), fallback: "لم تُجرَ تعديلات آلية لأن الإصلاح الآمن لم يكن واضحًا." });
+        break;
+      }
     }
   }
 
