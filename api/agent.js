@@ -163,7 +163,7 @@ function runLocalPromptTools(prompt, p) {
   checks.push({ name: "non_empty_prompt", ok: text.trim().length >= 20, message: "البرومبت النهائي فارغ أو قصير جدًا." });
   checks.push({ name: "visual_specificity", ok: /lighting|composition|texture|camera|background|material|color|mood|lens|subject/i.test(text), message: "أضف تفاصيل بصرية مثل الإضاءة والتكوين والخامات." });
   if (ratio) {
-    const ratioMentioned = text.includes(ratio) || new RegExp("--ar\s+" + ratio.replace(":", "\s*:\s*")).test(text) || /aspect ratio/i.test(text);
+    const ratioMentioned = text.includes(ratio) || new RegExp("--ar\\s+" + ratio.replace(":", "\\s*:\\s*")).test(text) || /aspect ratio/i.test(text) || (ratio === "9:16" && /vertical|portrait/i.test(text)) || (ratio === "16:9" && /horizontal|landscape|widescreen/i.test(text));
     checks.push({ name: "aspect_ratio", ok: ratioMentioned, message: "تحقق من تضمين نسبة الأبعاد المطلوبة: " + ratio });
   }
   if (/midjourney/i.test(target)) {
@@ -187,7 +187,7 @@ async function runAgentPipeline(provider, key, model, p) {
     if (!plan || !Array.isArray(plan.required_elements) || !Array.isArray(plan.validation_criteria)) throw new Error("خطة غير مكتملة");
     trace.push({ step: "planning", status: "completed", tool: "llm_planner", details: plan });
   } catch (e) {
-    plan = { goal: p.idea, required_elements: [p.idea], visual_strategy: "Create a clear, tool-compatible visual prompt.", tool_constraints: [String(p.target || ""), String(p.ratio || "")], validation_criteria: ["non-empty", "specific", "tool-compatible"], risks_or_unknowns: ["The planning model did not return a valid plan."] };
+    plan = { goal: p.idea, required_elements: [], visual_strategy: "Use the user idea and explicit settings to build a clear, tool-compatible visual prompt. Semantic requirements were not independently decomposed because planning failed.", tool_constraints: [String(p.target || ""), String(p.ratio || "")].filter(Boolean), validation_criteria: ["non-empty", "specific", "tool-compatible", "preserve explicit user constraints"], risks_or_unknowns: ["The planning model did not return a valid plan; semantic requirement auditing is limited."] };
     trace.push({ step: "planning", status: "fallback", tool: "basic_plan", reason: String(e.message || e).slice(0, 180) });
   }
 
