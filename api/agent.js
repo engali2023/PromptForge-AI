@@ -2,14 +2,8 @@ const PROVIDERS = {
   pollinations: { url: "https://gen.pollinations.ai/v1/chat/completions", kind: "openai" },
   openrouter: { url: "https://openrouter.ai/api/v1/chat/completions", kind: "openai" },
   groq: { url: "https://api.groq.com/openai/v1/chat/completions", kind: "openai" },
-  cohere: { url: "https://api.cohere.com/v2/chat", kind: "cohere" },
-  gemini: { url: "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", kind: "openai" }
+  cohere: { url: "https://api.cohere.com/v2/chat", kind: "cohere" }
 };
-// Only models listed as free on Google’s official Gemini API pricing page are eligible for auto-free routing.
-const GEMINI_FREE_MODELS = [
-  { id: "gemini-3.8-flash", name: "Gemini 3.8 Flash" },
-  { id: "gemini-3-flash-preview", name: "Gemini 3 Flash Preview" }
-];
 let catalogCache = { at: 0, data: null };
 
 function systemPrompt() {
@@ -44,9 +38,7 @@ async function getFreeCatalog(apiKeys = {}, options = {}) {
     openrouter: [{ id: "openrouter/free", name: "OpenRouter Free Router (توجيه مجاني تلقائي)", verifiedFree: true }],
     groq: [],
     cohere: [],
-    gemini: [],
     notes: {
-      gemini: "يُعرض في الوضع التلقائي فقط نموذج Gemini الموجود في قائمة Google المجانية؛ تظل الحصة وحدود الحساب مطبقة.",
       groq: "تظهر النماذج عند إدخال مفتاح Groq؛ لا يستخدمها التوجيه التلقائي إلا بعد تأكيد أن الحساب ضمن الخطة/الحصة المجانية.",
       cohere: "تظهر النماذج عند إدخال مفتاح Cohere؛ لا يستخدمها التوجيه التلقائي إلا بعد تأكيد أن المفتاح ضمن Trial/الحصة المجانية."
     }
@@ -68,34 +60,13 @@ async function getFreeCatalog(apiKeys = {}, options = {}) {
     const free = list.filter(m => isVerifiedFree(m, "openrouter")).map(m => ({ id: m.id, name: m.name || m.id, verifiedFree: true }));
     result.openrouter = [{ id: "openrouter/free", name: "OpenRouter Free Router (توجيه مجاني تلقائي)", verifiedFree: true }, ...free];
   }
-  if (apiKeys.gemini?.trim()) {
-    try {
-      const r = await fetch("https://generativelanguage.googleapis.com/v1beta/models", { headers: { Accept: "application/json", "x-goog-api-key": apiKeys.gemini.trim() }, signal: AbortSignal.timeout(9000) });
-      if (r.ok) {
-        const body = await r.json();
-        const available = new Set((body.models || []).filter(m => Array.isArray(m.supportedGenerationMethods) && m.supportedGenerationMethods.includes("generateContent")).map(m => String(m.name || "").replace(/^models\//, "")));
-        result.gemini = GEMINI_FREE_MODELS.filter(m => available.has(m.id)).map(m => ({ ...m, verifiedFree: true }));
-        if (!result.gemini.length) result.notes.gemini = "لم يُرجع مفتاحك أي نموذج من قائمة Gemini المجانية المعتمدة. تحقق من أهلية الخطة المجانية والموديلات المتاحة في AI Studio.";
-      } else {
-        const detail = await r.text();
-        result.notes.gemini = `تعذر جلب نماذج Gemini (HTTP ${r.status}): ${detail.slice(0, 180)}`;
-      }
-    } catch (e) { result.notes.gemini = "تعذر الوصول إلى كتالوج Gemini: " + e.message; }
-  }
   if (apiKeys.groq?.trim()) {
     try {
       const r = await fetch("https://api.groq.com/openai/v1/models", { headers: { Authorization: `Bearer ${apiKeys.groq.trim()}`, Accept: "application/json" }, signal: AbortSignal.timeout(9000) });
       if (r.ok) {
         const body = await r.json();
-        // Exclude models known from runtime errors to require manual terms acceptance,
-        // return malformed JSON frequently, or be unusable under the observed tiny output-token quota.
-        const excludedGroq = /whisper|guard|embed|tts|speech|audio|canopylabs\/orpheus[^/]*|allam-2-7b|qwen\/qwen3\.8-27b/i;
-        result.groq = (body.data || []).filter(m => m.id && !excludedGroq.test(m.id) && !/deprecated|preview/i.test(String(m.id)))
-          .map(m => ({ id: m.id, name: m.id, requiresFreeTierConfirmation: true }))
-          .sort((a, b) => {
-            const preferred = id => /llama-3\.3-70b-versatile|llama-3\.1-8b-instant|openai\/gpt-oss-20b/i.test(id) ? 0 : 1;
-            return preferred(a.id) - preferred(b.id);
-          }).slice(0, 15);
+        result.groq = (body.data || []).filter(m => m.id && !/whisper|guard|embed|tts|speech|audio/i.test(m.id))
+          .map(m => ({ id: m.id, name: m.id, requiresFreeTierConfirmation: true })).slice(0, 30);
       } else result.notes.groq = `تعذر جلب كتالوج Groq (HTTP ${r.status}).`;
     } catch (e) { result.notes.groq = "تعذر الوصول إلى كتالوج Groq: " + e.message; }
   }
@@ -121,17 +92,8 @@ async function callProvider(provider, key, model, sys, user, maxTokens = 1200) {
   if (provider === "openrouter") { headers["HTTP-Referer"] = process.env.APP_URL || "https://vercel.app"; headers["X-Title"] = "PromptForge AI"; }
   let body;
   if (provider === "cohere") body = { model, messages: [{ role: "system", content: sys }, { role: "user", content: user }], temperature: 0.6, max_tokens: maxTokens };
-  else body = { model, messages: [{ role: "system", content: sys }, { role: "user", content: user }], temperature: 0.2, max_tokens: Math.max(256, Math.min(maxTokens, provider === "gemini" ? 1800 : 1200)), stream: false, ...(provider === "gemini" || provider === "groq" ? { response_format: { type: "json_object" } } : {}), ...(provider === "gemini" ? { reasoning_effort: "low" } : {}) };
-  let response;
-  // Retry one transient 503 overload response; do not blindly retry quota 429s.
-  for (let attempt = 0; attempt < 2; attempt++) {
-    response = await fetch(cfg.url, { method: "POST", headers, body: JSON.stringify(body), signal: AbortSignal.timeout(18000) });
-    if (response.status !== 503 || attempt === 1) break;
-    const retryAfter = Number(response.headers.get("retry-after"));
-    const delayMs = Number.isFinite(retryAfter) && retryAfter > 0 ? Math.min(1800, retryAfter * 1000) : 800;
-    await response.body?.cancel().catch(() => {});
-    await new Promise(resolve => setTimeout(resolve, delayMs));
-  }
+  else body = { model, messages: [{ role: "system", content: sys }, { role: "user", content: user }], temperature: 0.6, max_tokens: maxTokens, stream: false };
+  const response = await fetch(cfg.url, { method: "POST", headers, body: JSON.stringify(body), signal: AbortSignal.timeout(9000) });
   const raw = await response.text();
   if (!response.ok) {
     let detail = raw.slice(0, 350);
@@ -140,32 +102,16 @@ async function callProvider(provider, key, model, sys, user, maxTokens = 1200) {
   }
   const json = JSON.parse(raw);
   const content = provider === "cohere" ? (json.message?.content || []).map(x => x.text || "").join("\n") : json.choices?.[0]?.message?.content;
-  if (typeof content !== "string" || !content.trim()) throw new Error(`${provider}: استجابة فارغة من النموذج (HTTP ${response.status}); تحقق من توافق النموذج مع Chat Completions أو جرّب نموذجاً آخر.`);
+  if (typeof content !== "string" || !content.trim()) throw new Error(`${provider}: استجابة فارغة من النموذج.`);
   return content;
 }
 function parseAgentJson(raw) {
-  if (raw && typeof raw === "object") return raw;
-  const source = String(raw || "").replace(new RegExp("^\\uFEFF"), "").trim();
-  const candidates = [source];
-  const fenceStart = source.indexOf("```");
-  if (fenceStart >= 0) {
-    const firstLineEnd = source.indexOf("\n", fenceStart);
-    const fenceEnd = source.indexOf("```", firstLineEnd + 1);
-    if (firstLineEnd >= 0 && fenceEnd > firstLineEnd) candidates.push(source.slice(firstLineEnd + 1, fenceEnd).trim());
+  try { return JSON.parse(raw); } catch {
+    const match = raw.match(/\{[\s\S]*\}/);
+    if (!match) throw new Error("النموذج لم يرجع JSON صالحاً؛ سيتم تجربة نموذج آخر في الوضع التلقائي.");
+    return JSON.parse(match[0]);
   }
-  const first = source.indexOf("{");
-  const last = source.lastIndexOf("}");
-  if (first >= 0 && last > first) candidates.push(source.slice(first, last + 1));
-  let lastError;
-  for (const candidate of [...new Set(candidates)]) {
-    try { return JSON.parse(candidate); } catch (e) { lastError = e; }
-    const cleaned = candidate.replace(/,\s*([}\]])/g, "$1");
-    try { return JSON.parse(cleaned); } catch (e) { lastError = e; }
-  }
-  const detail = lastError && lastError.message ? lastError.message : "صيغة غير معروفة";
-  throw new Error("تعذر تحليل JSON من النموذج: " + detail + ". أعد المحاولة أو استخدم مزودًا آخر.");
 }
-
 function normalizeResult(data) {
   const keys = ["Clarity", "Completeness", "Tool Compatibility", "Specificity", "Creativity"];
   data.scores = data.scores || {};
@@ -188,12 +134,12 @@ function auditFinalPrompt(prompt, p, plan) {
   }
   const target = String(p.target || "");
   if (/midjourney/i.test(target)) {
-    add("midjourney_invalid_style_parameter", !/--style\s+cinematic\b/i.test(text), "معامل --style cinematic قد لا يكون صالحًا؛ اجعل cinematic وصفًا نصيًا.", "فحص صيغة معامل Midjourney.");
+    add("midjourney_invalid_style_parameter", !/--style\\s+cinematic\\b/i.test(text), "معامل --style cinematic قد لا يكون صالحًا؛ اجعل cinematic وصفًا نصيًا.", "فحص صيغة معامل Midjourney.");
   }
   const required = Array.isArray(plan?.required_elements) ? plan.required_elements : [];
   const requirementResults = required.slice(0, 15).map((item) => {
     const phrase = String(item || "").trim();
-    const words = phrase.toLowerCase().split(/[^a-z0-9\u0600-\u06ff]+/).filter(w => w.length >= 4);
+    const words = phrase.toLowerCase().split(/[^a-z0-9\\u0600-\\u06ff]+/).filter(w => w.length >= 4);
     const matchedWords = words.filter(w => lower.includes(w));
     const ratioMatched = words.length ? matchedWords.length / words.length : lower.includes(phrase.toLowerCase());
     const ok = ratioMatched >= 0.5 || lower.includes(phrase.toLowerCase());
@@ -232,8 +178,6 @@ function runLocalPromptTools(prompt, p) {
 
 async function runAgentPipeline(provider, key, model, p) {
   const trace = [];
-  let providerRateLimited = false;
-  const isRateLimitError = error => /HTTP 429|rate limit|rate_limit|tokens per minute|TPM/i.test(String(error?.message || error || ""));
   const startedAt = Date.now();
   const base = userPrompt(p);
   const planSystem = "You are the planning component of PromptForge. Convert the user's creative request into a concise actionable plan. Return ONLY valid JSON: {\"goal\":\"...\",\"required_elements\":[\"...\"],\"visual_strategy\":\"...\",\"tool_constraints\":[\"...\"],\"validation_criteria\":[\"...\"],\"risks_or_unknowns\":[\"...\"]}. Do not write the final prompt yet. Explanations must use the requested language.";
@@ -243,31 +187,13 @@ async function runAgentPipeline(provider, key, model, p) {
     if (!plan || !Array.isArray(plan.required_elements) || !Array.isArray(plan.validation_criteria)) throw new Error("خطة غير مكتملة");
     trace.push({ step: "planning", status: "completed", tool: "llm_planner", details: plan });
   } catch (e) {
-    providerRateLimited = isRateLimitError(e);
     plan = { goal: p.idea, required_elements: [], visual_strategy: "Use the user idea and explicit settings to build a clear, tool-compatible visual prompt. Semantic requirements were not independently decomposed because planning failed.", tool_constraints: [String(p.target || ""), String(p.ratio || "")].filter(Boolean), validation_criteria: ["non-empty", "specific", "tool-compatible", "preserve explicit user constraints"], risks_or_unknowns: ["The planning model did not return a valid plan; semantic requirement auditing is limited."] };
     trace.push({ step: "planning", status: "fallback", tool: "basic_plan", reason: String(e.message || e).slice(0, 180) });
   }
 
   const generationSystem = systemPrompt() + "\n\nAGENT PLAN (follow this plan):\n" + JSON.stringify(plan) + "\n\nReturn valid JSON matching the required output schema. Preserve user constraints.";
-  if (providerRateLimited) throw new Error("تجاوز مزود النموذج حد الاستخدام (HTTP 429) أثناء التخطيط؛ انتظر تجدد الحصة أو استخدم مزودًا آخر.");
-  let rawDraft;
-  let data;
-  try {
-    rawDraft = await callProvider(provider, key, model, generationSystem, base, 2200);
-    data = normalizeResult(parseAgentJson(rawDraft));
-  } catch (firstError) {
-    // HTTP/provider failures are not JSON parse failures. Preserve them so auto-routing
-    // can skip a model that needs terms acceptance or has exhausted its quota.
-    if (/HTTP 400|HTTP 401|HTTP 403|HTTP 404|HTTP 429|HTTP 5\d\d|requires terms acceptance|rate limit|OTPM|TPM/i.test(String(firstError.message || firstError))) throw firstError;
-    const repairSystem = "Return ONLY one complete valid JSON object matching this schema: " + JSON.stringify({ analysis: "brief Arabic intent summary", draft_prompt: "short English prompt", final_prompt: "complete English visual prompt", scores: { Clarity: 7, Completeness: 7, "Tool Compatibility": 7, Specificity: 7, Creativity: 7 }, evaluation_text: "brief Arabic evaluation", average_score: 7, parameters: "brief Arabic settings" }) + ". No markdown fences, no comments, no trailing commas. Keep strings concise and close every quote and brace.";
-    try {
-      const repairedRaw = await callProvider(provider, key, model, repairSystem, "Create the requested prompt now. User request and constraints:\n" + base.slice(0, 5000) + "\nRequired plan:\n" + JSON.stringify(plan).slice(0, 1800) + "\nPrevious response (repair only if useful):\n" + String(rawDraft || "").slice(0, 2500), 2200);
-      data = normalizeResult(parseAgentJson(repairedRaw));
-      trace.push({ step: "draft", status: "recovered", tool: "json_repair_retry", reason: String(firstError.message || firstError).slice(0, 180) });
-    } catch (repairError) {
-      throw new Error("تعذر إنشاء JSON صالح حتى بعد محاولة إصلاح واحدة. السبب الأول: " + String(firstError.message || firstError).slice(0, 180) + "؛ محاولة الإصلاح: " + String(repairError.message || repairError).slice(0, 180));
-    }
-  }
+  const rawDraft = await callProvider(provider, key, model, generationSystem, base, 1500);
+  let data = normalizeResult(parseAgentJson(rawDraft));
   trace.push({ step: "draft", status: "completed", tool: "llm_generator" });
 
   const evaluatorSystem = "You are an independent quality reviewer for image/video prompts. Evaluate the draft against the user's request and agent plan. Return ONLY valid JSON: {\"scores\":{\"Clarity\":1,\"Completeness\":1,\"Tool Compatibility\":1,\"Specificity\":1,\"Creativity\":1},\"issues\":[\"specific issue\"],\"must_improve\":true,\"evaluation_text\":\"brief explanation in requested language\"}. Scores are integers 1-10. Do not inflate scores. Do not claim that an image/video was actually generated or tested.";
@@ -275,7 +201,6 @@ async function runAgentPipeline(provider, key, model, p) {
   let reviewMode = "model";
   let validation = runLocalPromptTools(data.final_prompt, p);
   try {
-    if (providerRateLimited) throw new Error("تم تخطي المراجعة لأن المزود تجاوز حد TPM في مرحلة سابقة (HTTP 429).");
     review = parseAgentJson(await callProvider(provider, key, model, evaluatorSystem, "USER REQUIREMENTS:\n" + base.slice(0, 4500) + "\nPLAN:\n" + JSON.stringify(plan).slice(0, 2500) + "\nDRAFT PROMPT:\n" + String(data.final_prompt || "").slice(0, 5000), 650));
     const required = ["Clarity", "Completeness", "Tool Compatibility", "Specificity", "Creativity"];
     if (!review.scores || required.some(k => !Number.isFinite(Number(review.scores[k])))) throw new Error("مراجعة النموذج لم تتضمن درجات صالحة.");
@@ -284,22 +209,16 @@ async function runAgentPipeline(provider, key, model, p) {
     review.must_improve = review.must_improve === true || review.issues.length > 0;
     trace.push({ step: "independent_review", status: "completed", tool: "llm_reviewer", score: Number((required.reduce((s,k)=>s+review.scores[k],0)/required.length).toFixed(1)), issues_count: review.issues.length });
   } catch (e) {
-    providerRateLimited = providerRateLimited || isRateLimitError(e);
     reviewMode = "fallback";
     const issues = validation.issues.slice();
     review = { scores: { Clarity: 6, Completeness: 6, "Tool Compatibility": validation.passed ? 7 : 4, Specificity: validation.passed ? 7 : 5, Creativity: 6 }, issues, must_improve: issues.length > 0, evaluation_text: "تعذرت المراجعة المستقلة بواسطة النموذج؛ تم استخدام فحص برمجي محدود فقط." };
     trace.push({ step: "independent_review", status: "fallback", tool: "local_checks_only", reason: String(e.message || e).slice(0, 180), issues_count: issues.length });
   }
 
-  const requestedPasses = Math.max(0, Math.min(2, Number(p.maxRevisionPasses ?? 2) || 0));
-  // Avoid repeated calls to a provider after it has explicitly rate-limited this request.
-  const maxPasses = providerRateLimited ? 0 : requestedPasses;
+  const maxPasses = Math.max(0, Math.min(2, Number(p.maxRevisionPasses ?? 2) || 0));
   let revisionPasses = 0;
   const revisionHistory = [];
   const initialDraftPrompt = String(data.final_prompt || "");
-  if (providerRateLimited && requestedPasses > 0) {
-    trace.push({ step: "revision", status: "skipped_rate_limit", tool: "local_validation_only", reason: "توقفنا عن إرسال طلبات إضافية إلى المزود بعد HTTP 429 لتجنب استهلاك الحصة وإعادة الفشل." });
-  }
   for (let pass = 1; pass <= maxPasses; pass++) {
     validation = runLocalPromptTools(data.final_prompt, p);
     const issues = [...(review.issues || []), ...validation.issues];
@@ -311,7 +230,6 @@ async function runAgentPipeline(provider, key, model, p) {
     const revisionSystem = "You are the revision component of a prompt-engineering agent. Fix the supplied issues using the user request, agent plan, and tool-validation report. Preserve all required constraints. Do not claim to have generated or tested media. Return ONLY valid JSON using the standard PromptForge result schema.";
     const revisionUser = "USER REQUEST:\n" + base + "\nPLAN:\n" + JSON.stringify(plan) + "\nCURRENT RESULT:\n" + JSON.stringify(data) + "\nREVIEW ISSUES:\n" + JSON.stringify(issues) + "\nLOCAL TOOL VALIDATION:\n" + JSON.stringify(validation) + "\nRevise pass " + pass + " of " + maxPasses + ".";
     try {
-      if (providerRateLimited) throw new Error("تم إيقاف التحسين بالنموذج بعد بلوغ حد TPM (HTTP 429)؛ سيُستخدم الإصلاح المحلي الآمن فقط.");
       const revised = normalizeResult(parseAgentJson(await callProvider(provider, key, model, revisionSystem, revisionUser.slice(0, 9000), 1000)));
       const previousPrompt = data.final_prompt;
       if (typeof revised.final_prompt !== "string" || revised.final_prompt.trim().length < 20) throw new Error("المراجعة لم تنتج برومبت صالحًا.");
@@ -326,8 +244,7 @@ async function runAgentPipeline(provider, key, model, p) {
       const revisionError = String(e.message || e).slice(0, 220);
       // Avoid repeating the same request immediately after a rate-limit response.
       let retrySucceeded = false;
-      const rateLimited = isRateLimitError(revisionError);
-      providerRateLimited = providerRateLimited || rateLimited;
+      const rateLimited = /HTTP 429|rate limit|rate_limit|tokens per minute|TPM/i.test(revisionError);
       try {
         if (rateLimited) throw new Error("تجاوز حد الاستخدام 429؛ تم إيقاف إعادة المحاولة لتجنب استهلاك الحصة، وسيُستخدم الإصلاح المحلي الآمن إن أمكن.");
         const retrySystem = "Edit the prompt only. Return ONLY JSON with one property: final_prompt (string). Preserve the user's requirements. Do not explain.";
@@ -382,7 +299,6 @@ async function runAgentPipeline(provider, key, model, p) {
   // Independent decision audit: compare request, plan and final prompt.
   let decisionAudit = { status: "unavailable", summary: "تعذر إكمال التدقيق المستقل؛ الفحوص المحلية متاحة بشكل منفصل.", preserved_requirements: [], potential_violations: [], decisions_reviewed: [], uncertainty: ["لم يكتمل تدقيق النموذج المستقل."] };
   try {
-    if (providerRateLimited) throw new Error("تم إيقاف استدعاءات النموذج بعد HTTP 429؛ لم يُرسل طلب تدقيق إضافي حتى لا يتكرر استهلاك الحصة. الفحص المحلي ليس تدقيقًا مستقلًا.");
     const auditSystem = 'You are an independent quality auditor. Compare USER REQUEST, PLAN, and FINAL PROMPT. Return ONLY valid JSON: {"status":"pass|warning|fail","summary":"string","preserved_requirements":["string"],"potential_violations":["string"],"decisions_reviewed":[{"decision":"string","evidence":"string","verdict":"supported|uncertain|conflict","reason":"string"}],"uncertainty":["string"]}. Identify omissions, contradictions, and unjustified changes. Distinguish verifiable text facts from subjective design judgments. Never claim the image was generated or visually checked.';
     const auditUser = "USER REQUEST:\n" + base + "\nPLAN:\n" + JSON.stringify(plan) + "\nFINAL PROMPT:\n" + String(data.final_prompt || "") + "\nLOCAL VALIDATION:\n" + JSON.stringify(validation);
     const a = parseAgentJson(await callProvider(provider, key, model, auditSystem, ("USER REQUEST:\n" + base.slice(0, 3500) + "\nPLAN:\n" + JSON.stringify(plan).slice(0, 1800) + "\nFINAL PROMPT:\n" + String(data.final_prompt || "").slice(0, 4500) + "\nLOCAL VALIDATION:\n" + JSON.stringify(validation).slice(0, 1200)), 650));
@@ -412,7 +328,6 @@ async function runAgentPipeline(provider, key, model, p) {
     };
     trace.push({ step: "decision_audit", status: decisionAudit.status === "pass" ? "completed" : decisionAudit.status === "fail" ? "failed" : "warning", tool: "independent_llm_audit", summary: decisionAudit.summary, violations: decisionAudit.potential_violations.length, decisions_reviewed: decisionAudit.decisions_reviewed.length, unresolved_decisions: unsupportedDecisions.length });
   } catch (e) {
-    providerRateLimited = providerRateLimited || isRateLimitError(e);
     // Honest deterministic fallback: concrete local evidence, never label it an independent model audit.
     const promptText = String(data.final_prompt || "").toLowerCase();
     const localDecisions = [];
@@ -457,7 +372,6 @@ async function runAgentPipeline(provider, key, model, p) {
   decisionAudit.final_check_passed = finalAudit.passed;
   // One authoritative status per stage: no UI badge may imply success when final checks failed.
   trace.push({ step: "final_audit_gate", status: finalAudit.passed ? "completed" : "warning", tool: "deterministic_final_audit", checks_passed: finalAudit.checks.filter(x => x.ok).length, checks_total: finalAudit.checks.length, issues: finalAudit.issues });
-  if (providerRateLimited) trace.push({ step: "provider_usage", status: "rate_limited", provider, model, reason: "توقف الوكيل عن استدعاءات النموذج الإضافية بعد HTTP 429؛ استُكملت الفحوص المحلية فقط." });
   trace.push({ step: "tool_validation", status: validation.passed && finalAudit.passed ? "completed" : "warning", tool: validation.tool, checks: validation.checks, issues: [...validation.issues, ...finalAudit.issues] });
   if (typeof data.final_prompt !== "string" || data.final_prompt.trim().length < 20) throw new Error("لم ينتج الوكيل برومبت نهائيًا صالحًا.");
   data.scores = review.scores || data.scores;
@@ -485,23 +399,14 @@ async function tryAuto(p, action) {
   const confirmed = p.freeTierConfirmed || {};
   const catalog = await getFreeCatalog(keys, { force: true });
   const attempts = [];
-  // Interleave providers so OpenRouter's several catalog entries cannot consume the entire retry budget.
-  const queues = [];
-  if (keys.gemini?.trim()) queues.push({ provider: "gemini", key: keys.gemini.trim(), models: catalog.gemini.slice(0, 4) });
-  if (keys.pollinations?.trim()) queues.push({ provider: "pollinations", key: keys.pollinations.trim(), models: catalog.pollinations.slice(0, 4) });
-  if (keys.openrouter?.trim()) queues.push({ provider: "openrouter", key: keys.openrouter.trim(), models: catalog.openrouter.slice(0, 5) });
-  if (keys.groq?.trim() && confirmed.groq === true) queues.push({ provider: "groq", key: keys.groq.trim(), models: catalog.groq.slice(0, 5) });
-  if (keys.cohere?.trim() && confirmed.cohere === true) queues.push({ provider: "cohere", key: keys.cohere.trim(), models: catalog.cohere.slice(0, 5) });
-  for (let round = 0; round < 5; round++) {
-    for (const queue of queues) {
-      const model = queue.models[round];
-      if (model) attempts.push({ provider: queue.provider, key: queue.key, model: model.id });
-    }
-  }
+  if (keys.pollinations?.trim()) for (const m of catalog.pollinations.slice(0, 4)) attempts.push({ provider: "pollinations", key: keys.pollinations.trim(), model: m.id });
+  if (keys.openrouter?.trim()) for (const m of catalog.openrouter.slice(0, 5)) attempts.push({ provider: "openrouter", key: keys.openrouter.trim(), model: m.id });
+  if (keys.groq?.trim() && confirmed.groq === true) for (const m of catalog.groq.slice(0, 5)) attempts.push({ provider: "groq", key: keys.groq.trim(), model: m.id });
+  if (keys.cohere?.trim() && confirmed.cohere === true) for (const m of catalog.cohere.slice(0, 5)) attempts.push({ provider: "cohere", key: keys.cohere.trim(), model: m.id });
 
   if (action === "test-auto") {
     const statuses = [];
-    for (const provider of ["gemini", "pollinations", "openrouter", "groq", "cohere"]) {
+    for (const provider of ["pollinations", "openrouter", "groq", "cohere"]) {
       const key = keys[provider]?.trim();
       if (!key) { statuses.push({ provider, ok: false, message: "لم يتم إدخال مفتاح" }); continue; }
       if ((provider === "groq" || provider === "cohere") && confirmed[provider] !== true) {
@@ -519,51 +424,21 @@ async function tryAuto(p, action) {
       if (!success) statuses.push({ provider, ok: false, message });
     }
     return { success: statuses.some(s => s.ok), statuses, catalog: {
-      gemini: catalog.gemini.length, pollinations: catalog.pollinations.length, openrouter: catalog.openrouter.length,
+      pollinations: catalog.pollinations.length, openrouter: catalog.openrouter.length,
       groq: catalog.groq.length, cohere: catalog.cohere.length
     }};
   }
-  if (!attempts.length) throw new Error("لم يتم إعداد أي مزوّد مؤهل للوضع المجاني. أدخل مفتاح Gemini أو مفاتيح مزودين آخرين. فعّل تأكيد الخطة المجانية لـ Groq/Cohere فقط إذا كنت متأكداً من نوع حسابك.");
+  if (!attempts.length) throw new Error("لم يتم إعداد أي مزوّد مؤهل للوضع المجاني. أدخل مفاتيح API، وفعّل تأكيد الخطة المجانية لـ Groq/Cohere فقط إذا كنت متأكداً من نوع حسابك.");
   const failures = [];
-  const rateLimitedProviders = new Set();
-  // Try more than one provider, but never keep hammering a provider after it returns 429.
-  for (const item of attempts.slice(0, 10)) {
-    if (rateLimitedProviders.has(item.provider)) continue;
+  for (const item of attempts.slice(0, 3)) {
     try {
       const data = await runAgentPipeline(item.provider, item.key, item.model, p);
-      const steps = Array.isArray(data?.agent?.steps) ? data.agent.steps : [];
-      const providerWasRateLimited = steps.some(step => step.step === "provider_usage" && step.status === "rate_limited");
-      if (providerWasRateLimited) {
-        const error = "تم إنشاء مسودة جزئية، لكن المزود تجاوز حد الاستخدام أثناء مراحل التدقيق؛ لن تُعتمد النتيجة كنجاح كامل.";
-        rateLimitedProviders.add(item.provider);
-        failures.push({ provider: item.provider, model: item.model, error });
-        console.warn(JSON.stringify({ event: "promptforge_auto_provider_rate_limited_mid_pipeline", provider: item.provider, model: item.model, error }));
-        continue;
-      }
       data.routing = { mode: "auto-free", provider: item.provider, model: item.model, fallbackCount: failures.length,
         attempted: failures.map(x => ({ provider: x.provider, model: x.model, error: x.error })) };
       return data;
-    } catch (e) {
-      const error = String(e?.message || e).slice(0, 450);
-      if (/HTTP 429|rate limit|rate_limit|TPM|OTPM/i.test(error)) rateLimitedProviders.add(item.provider);
-      failures.push({ provider: item.provider, model: item.model, error });
-      console.warn(JSON.stringify({ event: "promptforge_auto_fallback", provider: item.provider, model: item.model, error }));
-    }
+    } catch (e) { failures.push({ provider: item.provider, model: item.model, error: e.message }); }
   }
-  const isRateLimited = f => /HTTP 429|rate limit|rate_limit|TPM/i.test(f.error);
-  const rateLimited = failures.some(isRateLimited);
-  const allRateLimited = failures.length > 0 && failures.every(isRateLimited);
-  const unavailable = failures.some(f => /HTTP 503|HTTP 502|timeout|timed out|aborted/i.test(f.error));
-  const has503 = failures.some(f => /HTTP 503|UNAVAILABLE|high demand/i.test(f.error));
-  const has429 = failures.some(isRateLimited);
-  const headline = allRateLimited
-    ? "كل النماذج التي جُرّبت رفضت الطلب بسبب حد الاستخدام (429). تحقق من الحصة في لوحة المزود أو استخدم مزودًا آخر."
-    : has503 && has429
-      ? "Gemini يواجه ضغطًا مؤقتًا (503) ونموذج آخر تجاوز حد الاستخدام (429). أُعيدت محاولة 503 تلقائيًا؛ جرّب لاحقًا أو أضف مزودًا بديلًا."
-      : unavailable && !rateLimited
-        ? "النماذج التي جُرّبت غير متاحة مؤقتًا (مهلة/503). أُعيدت محاولة 503 تلقائيًا؛ جرّب لاحقًا أو أضف مزودًا بديلًا."
-        : "فشل بعض مزودي النماذج لأسباب مختلفة؛ راجع خطأ كل نموذج أدناه. أخطاء 400/404 تتطلب تعديل إعداد النموذج، أما 429 فتعني حد استخدام.";
-  throw new Error(headline + " " + failures.map(f => `${f.provider}/${f.model}: ${f.error}`).join(" | ").slice(0, 1400));
+  throw new Error("تعذّر تنفيذ الطلب عبر النماذج المجانية/المؤكدة التي تمت تجربتها (بحد أقصى 3 نماذج لتقليل الانتظار). " + failures.map(f => `${f.provider}/${f.model}: ${f.error}`).join(" | ").slice(0, 1400));
 }
 export default async function handler(req, res) {
   res.setHeader("Cache-Control", "no-store");
@@ -595,7 +470,7 @@ export default async function handler(req, res) {
   } catch (error) {
     const message = String(error?.message || "حدث خطأ غير متوقع في تنفيذ الوكيل.").slice(0, 1400);
     const requestId = (globalThis.crypto?.randomUUID?.() || "pf-" + Date.now().toString(36));
-    const upstreamMatch = message.match(/HTTP (400|401|403|404|408|409|413|429|500|502|503|504)\b/);
+    const upstreamMatch = message.match(/HTTP (400|401|403|404|408|409|413|429|500|502|503|504)\\b/);
     const status = upstreamMatch || /تعذر الاتصال بمزود|استجابة فارغة من النموذج|ليست JSON صالحًا/.test(message) ? 502 : 500;
     console.error(JSON.stringify({
       event: "promptforge_request_failed",
