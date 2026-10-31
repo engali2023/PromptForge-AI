@@ -115,7 +115,16 @@ async function callProvider(provider, key, model, sys, user, maxTokens = 1200) {
   let body;
   if (provider === "cohere") body = { model, messages: [{ role: "system", content: sys }, { role: "user", content: user }], temperature: 0.6, max_tokens: maxTokens };
   else body = { model, messages: [{ role: "system", content: sys }, { role: "user", content: user }], temperature: 0.4, max_tokens: Math.max(maxTokens, provider === "gemini" ? 2200 : maxTokens), stream: false, ...(provider === "gemini" ? { response_format: { type: "json_object" }, reasoning_effort: "low" } : {}) };
-  const response = await fetch(cfg.url, { method: "POST", headers, body: JSON.stringify(body), signal: AbortSignal.timeout(18000) });
+  let response;
+  // Retry one transient 503 overload response; do not blindly retry quota 429s.
+  for (let attempt = 0; attempt < 2; attempt++) {
+    response = await fetch(cfg.url, { method: "POST", headers, body: JSON.stringify(body), signal: AbortSignal.timeout(18000) });
+    if (response.status !== 503 || attempt === 1) break;
+    const retryAfter = Number(response.headers.get("retry-after"));
+    const delayMs = Number.isFinite(retryAfter) && retryAfter > 0 ? Math.min(1800, retryAfter * 1000) : 800;
+    await response.body?.cancel().catch(() => {});
+    await new Promise(resolve => setTimeout(resolve, delayMs));
+  }
   const raw = await response.text();
   if (!response.ok) {
     let detail = raw.slice(0, 350);
@@ -487,7 +496,7 @@ async function tryAuto(p, action) {
   }
   if (!attempts.length) throw new Error("لم يتم إعداد أي مزوّد مؤهل للوضع المجاني. أدخل مفتاح Gemini أو مفاتيح مزودين آخرين. فعّل تأكيد الخطة المجانية لـ Groq/Cohere فقط إذا كنت متأكداً من نوع حسابك.");
   const failures = [];
-  for (const item of attempts.slice(0, 3)) {
+  for (const item of attempts.slice(0, 5)) {
     try {
       const data = await runAgentPipeline(item.provider, item.key, item.model, p);
       data.routing = { mode: "auto-free", provider: item.provider, model: item.model, fallbackCount: failures.length,
@@ -503,11 +512,15 @@ async function tryAuto(p, action) {
   const rateLimited = failures.some(isRateLimited);
   const allRateLimited = failures.length > 0 && failures.every(isRateLimited);
   const unavailable = failures.some(f => /HTTP 503|HTTP 502|timeout|timed out|aborted/i.test(f.error));
+  const has503 = failures.some(f => /HTTP 503|UNAVAILABLE|high demand/i.test(f.error));
+  const has429 = failures.some(isRateLimited);
   const headline = allRateLimited
-    ? "كل النماذج التي جُرّبت رفضت الطلب بسبب حد الاستخدام (429). انتظر تجدد الحصة أو أضف مزودًا آخر."
-    : unavailable && !rateLimited
-      ? "النماذج التي جُرّبت غير متاحة مؤقتًا (مهلة/503). جرّب لاحقًا أو أضف مزودًا بديلًا."
-      : "فشل بعض مزودي النماذج لأسباب مختلفة؛ راجع خطأ كل نموذج أدناه. أخطاء 400/404 تتطلب تعديل إعداد النموذج، أما 429 فتعني حد استخدام.";
+    ? "كل النماذج التي جُرّبت رفضت الطلب بسبب حد الاستخدام (429). تحقق من الحصة في لوحة المزود أو استخدم مزودًا آخر."
+    : has503 && has429
+      ? "Gemini يواجه ضغطًا مؤقتًا (503) ونموذج آخر تجاوز حد الاستخدام (429). أُعيدت محاولة 503 تلقائيًا؛ جرّب لاحقًا أو أضف مزودًا بديلًا."
+      : unavailable && !rateLimited
+        ? "النماذج التي جُرّبت غير متاحة مؤقتًا (مهلة/503). أُعيدت محاولة 503 تلقائيًا؛ جرّب لاحقًا أو أضف مزودًا بديلًا."
+        : "فشل بعض مزودي النماذج لأسباب مختلفة؛ راجع خطأ كل نموذج أدناه. أخطاء 400/404 تتطلب تعديل إعداد النموذج، أما 429 فتعني حد استخدام.";
   throw new Error(headline + " " + failures.map(f => `${f.provider}/${f.model}: ${f.error}`).join(" | ").slice(0, 1400));
 }
 export default async function handler(req, res) {
