@@ -93,7 +93,7 @@ async function callProvider(provider, key, model, sys, user) {
   let body;
   if (provider === "cohere") body = { model, messages: [{ role: "system", content: sys }, { role: "user", content: user }], temperature: 0.6, max_tokens: 3500 };
   else body = { model, messages: [{ role: "system", content: sys }, { role: "user", content: user }], temperature: 0.6, max_tokens: 3500, stream: false };
-  const response = await fetch(cfg.url, { method: "POST", headers, body: JSON.stringify(body), signal: AbortSignal.timeout(28000) });
+  const response = await fetch(cfg.url, { method: "POST", headers, body: JSON.stringify(body), signal: AbortSignal.timeout(12000) });
   const raw = await response.text();
   if (!response.ok) {
     let detail = raw.slice(0, 350);
@@ -119,6 +119,61 @@ function normalizeResult(data) {
   data.average_score = Number((keys.reduce((sum, key) => sum + data.scores[key], 0) / keys.length).toFixed(1));
   return data;
 }
+
+async function runAgentPipeline(provider, key, model, p) {
+  const trace = [];
+  const startedAt = Date.now();
+  const base = userPrompt(p);
+  const rawDraft = await callProvider(provider, key, model, systemPrompt(), base);
+  let data = normalizeResult(parseAgentJson(rawDraft));
+  trace.push({ step: "draft", status: "completed" });
+
+  const evaluatorSystem = "You are a strict quality reviewer for image/video prompts. Evaluate the supplied draft against the user's request. Do not rewrite the prompt yet. Return ONLY valid JSON with schema: {\"scores\":{\"Clarity\":1,\"Completeness\":1,\"Tool Compatibility\":1,\"Specificity\":1,\"Creativity\":1},\"average_score\":1,\"issues\":[\"specific issue\"],\"must_improve\":true,\"evaluation_text\":\"brief explanation in the requested explanation language\"}. Scores are integers from 1 to 10. Penalize missing requested details, vague wording, unsupported parameters, and incompatibility with the selected tool. A score of 8+ requires a usable, specific, complete prompt.";
+  const evaluatorUser = "USER REQUIREMENTS:\n" + base + "\n\nDRAFT TO REVIEW:\n" + JSON.stringify(data) + "\n\nEvaluate only against these requirements.";
+  let review = null;
+  try {
+    review = parseAgentJson(await callProvider(provider, key, model, evaluatorSystem, evaluatorUser));
+    trace.push({ step: "independent_review", status: "completed" });
+  } catch (e) {
+    trace.push({ step: "independent_review", status: "unavailable", reason: String(e.message || e).slice(0, 180) });
+  }
+
+  if (review && review.scores) {
+    data.scores = review.scores;
+    data.average_score = Number(review.average_score) || 0;
+    data.evaluation_text = review.evaluation_text || data.evaluation_text || "";
+  }
+  const needsRevision = review && (review.must_improve === true ||
+    Number(review.average_score) < 8 ||
+    (Array.isArray(review.issues) && review.issues.length > 0));
+
+  if (needsRevision) {
+    const revisionSystem = "You are a prompt engineer revising a draft using a review report. Fix concrete issues; preserve the user's intent and constraints. Do not claim to have generated or tested an image/video. Return ONLY valid JSON using schema: {\"analysis\":\"explanation in requested language\",\"draft_prompt\":\"original draft\",\"final_prompt\":\"improved final English prompt\",\"scores\":{\"Clarity\":1,\"Completeness\":1,\"Tool Compatibility\":1,\"Specificity\":1,\"Creativity\":1},\"evaluation_text\":\"what was corrected, in requested language\",\"average_score\":8,\"parameters\":\"technical settings and caveats in requested language\"}.";
+    const revisionUser = "USER REQUIREMENTS:\n" + base + "\n\nCURRENT RESULT:\n" + JSON.stringify(data) + "\n\nREVIEW REPORT:\n" + JSON.stringify(review) + "\n\nRevise once. Ensure final_prompt follows the requested tool and aspect ratio.";
+    try {
+      const revised = normalizeResult(parseAgentJson(await callProvider(provider, key, model, revisionSystem, revisionUser)));
+      data = { ...data, ...revised };
+      trace.push({ step: "revision", status: "completed" });
+    } catch (e) {
+      trace.push({ step: "revision", status: "failed", reason: String(e.message || e).slice(0, 180) });
+    }
+  } else {
+    trace.push({ step: "revision", status: "not_needed" });
+  }
+
+  if (typeof data.final_prompt !== "string" || data.final_prompt.trim().length < 20) {
+    throw new Error("لم ينتج النموذج برومبت نهائيًا صالحًا؛ جرّب نموذجًا آخر أو أعد المحاولة.");
+  }
+  data.agent = {
+    version: "2.0",
+    mode: "bounded-review-and-revision",
+    steps: trace,
+    elapsed_ms: Date.now() - startedAt,
+    max_revision_passes: 1
+  };
+  return normalizeResult(data);
+}
+
 async function tryAuto(p, action) {
   const keys = p.apiKeys || {};
   const confirmed = p.freeTierConfirmed || {};
@@ -157,8 +212,7 @@ async function tryAuto(p, action) {
   const failures = [];
   for (const item of attempts) {
     try {
-      const raw = await callProvider(item.provider, item.key, item.model, systemPrompt(), userPrompt(p));
-      const data = normalizeResult(parseAgentJson(raw));
+      const data = await runAgentPipeline(item.provider, item.key, item.model, p);
       data.routing = { mode: "auto-free", provider: item.provider, model: item.model, fallbackCount: failures.length,
         attempted: failures.map(x => ({ provider: x.provider, model: x.model, error: x.error })) };
       return data;
@@ -190,8 +244,7 @@ export default async function handler(req, res) {
       return res.status(200).json({ success: true, provider: p.provider, model: p.model, reply: reply.trim().slice(0, 100) });
     }
     if (!p.idea?.trim()) return res.status(400).json({ error: "الفكرة مطلوبة." });
-    const raw = await callProvider(p.provider, p.apiKey.trim(), p.model.trim(), systemPrompt(), userPrompt(p));
-    const data = normalizeResult(parseAgentJson(raw));
+    const data = await runAgentPipeline(p.provider, p.apiKey.trim(), p.model.trim(), p);
     data.routing = { mode: "manual", provider: p.provider, model: p.model, fallbackCount: 0, attempted: [] };
     return res.status(200).json(data);
   } catch (error) {
