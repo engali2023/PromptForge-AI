@@ -87,8 +87,15 @@ async function getFreeCatalog(apiKeys = {}, options = {}) {
       const r = await fetch("https://api.groq.com/openai/v1/models", { headers: { Authorization: `Bearer ${apiKeys.groq.trim()}`, Accept: "application/json" }, signal: AbortSignal.timeout(9000) });
       if (r.ok) {
         const body = await r.json();
-        result.groq = (body.data || []).filter(m => m.id && !/whisper|guard|embed|tts|speech|audio/i.test(m.id))
-          .map(m => ({ id: m.id, name: m.id, requiresFreeTierConfirmation: true })).slice(0, 30);
+        // Exclude models known from runtime errors to require manual terms acceptance,
+        // return malformed JSON frequently, or be unusable under the observed tiny output-token quota.
+        const excludedGroq = /whisper|guard|embed|tts|speech|audio|canopylabs\/orpheus-arabic-saudi|allam-2-7b|qwen\/qwen3\.8-27b/i;
+        result.groq = (body.data || []).filter(m => m.id && !excludedGroq.test(m.id) && !/deprecated|preview/i.test(String(m.id)))
+          .map(m => ({ id: m.id, name: m.id, requiresFreeTierConfirmation: true }))
+          .sort((a, b) => {
+            const preferred = id => /llama-3\.3-70b-versatile|llama-3\.1-8b-instant|openai\/gpt-oss-20b/i.test(id) ? 0 : 1;
+            return preferred(a.id) - preferred(b.id);
+          }).slice(0, 15);
       } else result.notes.groq = `تعذر جلب كتالوج Groq (HTTP ${r.status}).`;
     } catch (e) { result.notes.groq = "تعذر الوصول إلى كتالوج Groq: " + e.message; }
   }
@@ -114,7 +121,7 @@ async function callProvider(provider, key, model, sys, user, maxTokens = 1200) {
   if (provider === "openrouter") { headers["HTTP-Referer"] = process.env.APP_URL || "https://vercel.app"; headers["X-Title"] = "PromptForge AI"; }
   let body;
   if (provider === "cohere") body = { model, messages: [{ role: "system", content: sys }, { role: "user", content: user }], temperature: 0.6, max_tokens: maxTokens };
-  else body = { model, messages: [{ role: "system", content: sys }, { role: "user", content: user }], temperature: 0.4, max_tokens: Math.max(maxTokens, provider === "gemini" ? 2200 : maxTokens), stream: false, ...(provider === "gemini" ? { response_format: { type: "json_object" }, reasoning_effort: "low" } : {}) };
+  else body = { model, messages: [{ role: "system", content: sys }, { role: "user", content: user }], temperature: 0.2, max_tokens: Math.max(256, Math.min(maxTokens, provider === "gemini" ? 1800 : 1200)), stream: false, ...(provider === "gemini" || provider === "groq" ? { response_format: { type: "json_object" } } : {}), ...(provider === "gemini" ? { reasoning_effort: "low" } : {}) };
   let response;
   // Retry one transient 503 overload response; do not blindly retry quota 429s.
   for (let attempt = 0; attempt < 2; attempt++) {
@@ -249,13 +256,16 @@ async function runAgentPipeline(provider, key, model, p) {
     rawDraft = await callProvider(provider, key, model, generationSystem, base, 2200);
     data = normalizeResult(parseAgentJson(rawDraft));
   } catch (firstError) {
-    const repairSystem = "Return ONLY one complete valid JSON object matching this schema: " + JSON.stringify({ final_prompt: "complete English visual prompt", negative_prompt: "", settings: {}, rationale: "brief", scores: { Clarity: 7, Completeness: 7, "Tool Compatibility": 7, Specificity: 7, Creativity: 7 }, recommendations: [] }) + ". No markdown fences, no comments, no trailing commas. Keep strings concise and close every quote and brace.";
+    // HTTP/provider failures are not JSON parse failures. Preserve them so auto-routing
+    // can skip a model that needs terms acceptance or has exhausted its quota.
+    if (/HTTP 400|HTTP 401|HTTP 403|HTTP 404|HTTP 429|HTTP 5\d\d|requires terms acceptance|rate limit|OTPM|TPM/i.test(String(firstError.message || firstError))) throw firstError;
+    const repairSystem = "Return ONLY one complete valid JSON object matching this schema: " + JSON.stringify({ analysis: "brief Arabic intent summary", draft_prompt: "short English prompt", final_prompt: "complete English visual prompt", scores: { Clarity: 7, Completeness: 7, "Tool Compatibility": 7, Specificity: 7, Creativity: 7 }, evaluation_text: "brief Arabic evaluation", average_score: 7, parameters: "brief Arabic settings" }) + ". No markdown fences, no comments, no trailing commas. Keep strings concise and close every quote and brace.";
     try {
       const repairedRaw = await callProvider(provider, key, model, repairSystem, "Create the requested prompt now. User request and constraints:\n" + base.slice(0, 5000) + "\nRequired plan:\n" + JSON.stringify(plan).slice(0, 1800) + "\nPrevious response (repair only if useful):\n" + String(rawDraft || "").slice(0, 2500), 2200);
       data = normalizeResult(parseAgentJson(repairedRaw));
       trace.push({ step: "draft", status: "recovered", tool: "json_repair_retry", reason: String(firstError.message || firstError).slice(0, 180) });
     } catch (repairError) {
-      throw new Error("فشل إنشاء مسودة JSON صالحة بعد محاولة الإصلاح. السبب الأول: " + String(firstError.message || firstError).slice(0, 180) + "؛ محاولة الإصلاح: " + String(repairError.message || repairError).slice(0, 180));
+      throw new Error("تعذر إنشاء JSON صالح حتى بعد محاولة إصلاح واحدة. السبب الأول: " + String(firstError.message || firstError).slice(0, 180) + "؛ محاولة الإصلاح: " + String(repairError.message || repairError).slice(0, 180));
     }
   }
   trace.push({ step: "draft", status: "completed", tool: "llm_generator" });
