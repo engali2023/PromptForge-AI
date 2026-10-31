@@ -120,71 +120,109 @@ function normalizeResult(data) {
   return data;
 }
 
+function runLocalPromptTools(prompt, p) {
+  const text = String(prompt || "");
+  const target = String(p.target || "");
+  const ratio = String(p.ratio || "");
+  const checks = [];
+  checks.push({ name: "non_empty_prompt", ok: text.trim().length >= 20, message: "البرومبت النهائي فارغ أو قصير جدًا." });
+  checks.push({ name: "visual_specificity", ok: /lighting|composition|texture|camera|background|material|color|mood|lens|subject/i.test(text), message: "أضف تفاصيل بصرية مثل الإضاءة والتكوين والخامات." });
+  if (ratio) {
+    const ratioMentioned = text.includes(ratio) || new RegExp("--ar\\s+" + ratio.replace(":", "\\s*:\\s*")).test(text) || /aspect ratio/i.test(text);
+    checks.push({ name: "aspect_ratio", ok: ratioMentioned, message: "تحقق من تضمين نسبة الأبعاد المطلوبة: " + ratio });
+  }
+  if (/midjourney/i.test(target)) {
+    const unsupportedStyle = /--style\s+cinematic\b/i.test(text);
+    checks.push({ name: "midjourney_parameter_sanity", ok: !unsupportedStyle, message: "المعامل --style cinematic قد لا يكون صالحًا في Midjourney؛ استخدم وصفًا نصيًا للأسلوب." });
+    checks.push({ name: "midjourney_v6_syntax", ok: !/--v\s+5\b/i.test(text) || /v5/i.test(text), message: "تأكد من أن إصدار Midjourney ومعاملاته يطابقان اختيارك." });
+  }
+  if (/no text|no watermark/i.test(text)) checks.push({ name: "negative_constraints", ok: true, message: "" });
+  const issues = checks.filter(x => !x.ok).map(x => x.message);
+  return { tool: "local_prompt_validator", passed: checks.every(x => x.ok), checks, issues };
+}
+
 async function runAgentPipeline(provider, key, model, p) {
   const trace = [];
   const startedAt = Date.now();
   const base = userPrompt(p);
-  const rawDraft = await callProvider(provider, key, model, systemPrompt(), base);
-  let data = normalizeResult(parseAgentJson(rawDraft));
-  trace.push({ step: "draft", status: "completed" });
+  const planSystem = "You are the planning component of PromptForge. Convert the user's creative request into a concise actionable plan. Return ONLY valid JSON: {\"goal\":\"...\",\"required_elements\":[\"...\"],\"visual_strategy\":\"...\",\"tool_constraints\":[\"...\"],\"validation_criteria\":[\"...\"],\"risks_or_unknowns\":[\"...\"]}. Do not write the final prompt yet. Explanations must use the requested language.";
+  let plan;
+  try {
+    plan = parseAgentJson(await callProvider(provider, key, model, planSystem, base));
+    if (!plan || !Array.isArray(plan.required_elements) || !Array.isArray(plan.validation_criteria)) throw new Error("خطة غير مكتملة");
+    trace.push({ step: "planning", status: "completed", tool: "llm_planner", details: plan });
+  } catch (e) {
+    plan = { goal: p.idea, required_elements: [p.idea], visual_strategy: "Create a clear, tool-compatible visual prompt.", tool_constraints: [String(p.target || ""), String(p.ratio || "")], validation_criteria: ["non-empty", "specific", "tool-compatible"], risks_or_unknowns: ["The planning model did not return a valid plan."] };
+    trace.push({ step: "planning", status: "fallback", tool: "basic_plan", reason: String(e.message || e).slice(0, 180) });
+  }
 
-  const evaluatorSystem = "You are a strict quality reviewer for image/video prompts. Evaluate the supplied draft against the user's request. Do not rewrite the prompt yet. Return ONLY valid JSON with schema: {\"scores\":{\"Clarity\":1,\"Completeness\":1,\"Tool Compatibility\":1,\"Specificity\":1,\"Creativity\":1},\"average_score\":1,\"issues\":[\"specific issue\"],\"must_improve\":true,\"evaluation_text\":\"brief explanation in the requested explanation language\"}. Scores are integers from 1 to 10. Penalize missing requested details, vague wording, unsupported parameters, and incompatibility with the selected tool. A score of 8+ requires a usable, specific, complete prompt.";
-  const evaluatorUser = "USER REQUIREMENTS:\n" + base + "\n\nDRAFT TO REVIEW:\n" + JSON.stringify(data) + "\n\nEvaluate only against these requirements.";
+  const generationSystem = systemPrompt() + "\n\nAGENT PLAN (follow this plan):\n" + JSON.stringify(plan) + "\n\nReturn valid JSON matching the required output schema. Preserve user constraints.";
+  const rawDraft = await callProvider(provider, key, model, generationSystem, base);
+  let data = normalizeResult(parseAgentJson(rawDraft));
+  trace.push({ step: "draft", status: "completed", tool: "llm_generator" });
+
+  const evaluatorSystem = "You are an independent quality reviewer for image/video prompts. Evaluate the draft against the user's request and agent plan. Return ONLY valid JSON: {\"scores\":{\"Clarity\":1,\"Completeness\":1,\"Tool Compatibility\":1,\"Specificity\":1,\"Creativity\":1},\"issues\":[\"specific issue\"],\"must_improve\":true,\"evaluation_text\":\"brief explanation in requested language\"}. Scores are integers 1-10. Do not inflate scores. Do not claim that an image/video was actually generated or tested.";
   let review = null;
   let reviewMode = "model";
+  let validation = runLocalPromptTools(data.final_prompt, p);
   try {
-    review = parseAgentJson(await callProvider(provider, key, model, evaluatorSystem, evaluatorUser));
+    review = parseAgentJson(await callProvider(provider, key, model, evaluatorSystem, "USER REQUIREMENTS:\n" + base + "\nAGENT PLAN:\n" + JSON.stringify(plan) + "\nDRAFT:\n" + JSON.stringify(data)));
     const required = ["Clarity", "Completeness", "Tool Compatibility", "Specificity", "Creativity"];
-    if (!review.scores || required.some(k => !Number.isFinite(Number(review.scores[k])))) throw new Error("مراجعة النموذج لم تتضمن درجات صالحة لكل المعايير.");
+    if (!review.scores || required.some(k => !Number.isFinite(Number(review.scores[k])))) throw new Error("مراجعة النموذج لم تتضمن درجات صالحة.");
     review.scores = Object.fromEntries(required.map(k => [k, Math.max(1, Math.min(10, Math.round(Number(review.scores[k]))))]));
-    review.average_score = Number((required.reduce((sum, k) => sum + review.scores[k], 0) / required.length).toFixed(1));
     review.issues = Array.isArray(review.issues) ? review.issues.filter(x => typeof x === "string") : [];
-    review.must_improve = review.must_improve === true || review.average_score < 8 || review.issues.length > 0;
-    trace.push({ step: "independent_review", status: "completed", mode: "model", score: review.average_score, issues_count: review.issues.length });
+    review.must_improve = review.must_improve === true || review.issues.length > 0;
+    trace.push({ step: "independent_review", status: "completed", tool: "llm_reviewer", score: Number((required.reduce((s,k)=>s+review.scores[k],0)/required.length).toFixed(1)), issues_count: review.issues.length });
   } catch (e) {
     reviewMode = "fallback";
-    const promptText = String(data.final_prompt || "");
-    const checks = [
-      { ok: promptText.trim().length >= 120, issue: "البرومبت قصير وقد يحتاج تفاصيل إضافية." },
-      { ok: /lighting|composition|texture|camera|background|material|color|mood/i.test(promptText), issue: "قد يحتاج البرومبت إلى تفاصيل بصرية أكثر تحديدًا." },
-      { ok: promptText.includes(String(p.ratio || "")) || /--ar\\s+\\d+:\\d+|aspect ratio/i.test(promptText), issue: "لم يُعثر بوضوح على نسبة الأبعاد المطلوبة." }
-    ];
-    const issues = checks.filter(x => !x.ok).map(x => x.issue);
-    const score = Math.max(5, Math.min(8, 10 - issues.length));
-    review = { scores: { Clarity: score, Completeness: score, "Tool Compatibility": score, Specificity: score, Creativity: score }, average_score: score, issues, must_improve: issues.length > 0, evaluation_text: "تعذرت المراجعة المستقلة بواسطة النموذج؛ أُجري فحص احتياطي آلي محدود. " + (issues.length ? "ملاحظات: " + issues.join(" ") : "لم تُكتشف مشكلات بنيوية أساسية.") };
-    trace.push({ step: "independent_review", status: "fallback", mode: "deterministic_checks", reason: String(e.message || e).slice(0, 220), score, issues_count: issues.length });
+    const issues = validation.issues.slice();
+    review = { scores: { Clarity: 6, Completeness: 6, "Tool Compatibility": validation.passed ? 7 : 4, Specificity: validation.passed ? 7 : 5, Creativity: 6 }, issues, must_improve: issues.length > 0, evaluation_text: "تعذرت المراجعة المستقلة بواسطة النموذج؛ تم استخدام فحص برمجي محدود فقط." };
+    trace.push({ step: "independent_review", status: "fallback", tool: "local_checks_only", reason: String(e.message || e).slice(0, 180), issues_count: issues.length });
   }
-  data.scores = review.scores;
-  data.average_score = review.average_score;
-  data.evaluation_text = review.evaluation_text || data.evaluation_text || "";
-  const needsRevision = review && (review.must_improve === true ||
-    Number(review.average_score) < 8 ||
-    (Array.isArray(review.issues) && review.issues.length > 0));
 
-  if (needsRevision) {
-    const revisionSystem = "You are a prompt engineer revising a draft using a review report. Fix concrete issues; preserve the user's intent and constraints. Do not claim to have generated or tested an image/video. Return ONLY valid JSON using schema: {\"analysis\":\"explanation in requested language\",\"draft_prompt\":\"original draft\",\"final_prompt\":\"improved final English prompt\",\"scores\":{\"Clarity\":1,\"Completeness\":1,\"Tool Compatibility\":1,\"Specificity\":1,\"Creativity\":1},\"evaluation_text\":\"what was corrected, in requested language\",\"average_score\":8,\"parameters\":\"technical settings and caveats in requested language\"}.";
-    const revisionUser = "USER REQUIREMENTS:\n" + base + "\n\nCURRENT RESULT:\n" + JSON.stringify(data) + "\n\nREVIEW REPORT:\n" + JSON.stringify(review) + "\n\nRevise once. Ensure final_prompt follows the requested tool and aspect ratio.";
+  const maxPasses = Math.max(0, Math.min(2, Number(p.maxRevisionPasses ?? 2) || 0));
+  let revisionPasses = 0;
+  for (let pass = 1; pass <= maxPasses; pass++) {
+    validation = runLocalPromptTools(data.final_prompt, p);
+    const issues = [...(review.issues || []), ...validation.issues];
+    const reviewAverage = Number((Object.values(review.scores).reduce((s,v)=>s+Number(v),0)/5).toFixed(1));
+    if (!review.must_improve && validation.passed && reviewAverage >= 8) {
+      trace.push({ step: "revision", status: "not_needed", pass, reason: "review_and_tools_passed" });
+      break;
+    }
+    const revisionSystem = "You are the revision component of a prompt-engineering agent. Fix the supplied issues using the user request, agent plan, and tool-validation report. Preserve all required constraints. Do not claim to have generated or tested media. Return ONLY valid JSON using the standard PromptForge result schema.";
+    const revisionUser = "USER REQUEST:\n" + base + "\nPLAN:\n" + JSON.stringify(plan) + "\nCURRENT RESULT:\n" + JSON.stringify(data) + "\nREVIEW ISSUES:\n" + JSON.stringify(issues) + "\nLOCAL TOOL VALIDATION:\n" + JSON.stringify(validation) + "\nRevise pass " + pass + " of " + maxPasses + ".";
     try {
       const revised = normalizeResult(parseAgentJson(await callProvider(provider, key, model, revisionSystem, revisionUser)));
-      data = { ...data, ...revised };
-      trace.push({ step: "revision", status: "completed", score_before: review.average_score, score_after: revised.average_score });
+      const previousPrompt = data.final_prompt;
+      if (typeof revised.final_prompt !== "string" || revised.final_prompt.trim().length < 20) throw new Error("المراجعة لم تنتج برومبت صالحًا.");
+      data = { ...data, ...revised, draft_prompt: data.draft_prompt || previousPrompt };
+      revisionPasses++;
+      validation = runLocalPromptTools(data.final_prompt, p);
+      trace.push({ step: "revision", status: "completed", pass, tool: "llm_revision", changed: data.final_prompt !== previousPrompt, validation_passed: validation.passed });
+      review = { ...review, must_improve: !validation.passed, issues: validation.issues };
     } catch (e) {
-      trace.push({ step: "revision", status: "failed", reason: String(e.message || e).slice(0, 220) });
+      trace.push({ step: "revision", status: "failed", pass, reason: String(e.message || e).slice(0, 220) });
+      break;
     }
-  } else {
-    trace.push({ step: "revision", status: "not_needed" });
   }
 
-  if (typeof data.final_prompt !== "string" || data.final_prompt.trim().length < 20) {
-    throw new Error("لم ينتج النموذج برومبت نهائيًا صالحًا؛ جرّب نموذجًا آخر أو أعد المحاولة.");
-  }
+  validation = runLocalPromptTools(data.final_prompt, p);
+  trace.push({ step: "tool_validation", status: validation.passed ? "completed" : "warning", tool: validation.tool, checks: validation.checks, issues: validation.issues });
+  if (typeof data.final_prompt !== "string" || data.final_prompt.trim().length < 20) throw new Error("لم ينتج الوكيل برومبت نهائيًا صالحًا.");
+  data.scores = review.scores || data.scores;
+  data.average_score = Number((Object.values(data.scores).reduce((s,v)=>s+Number(v),0)/5).toFixed(1));
+  data.evaluation_text = (review.evaluation_text || data.evaluation_text || "") + (validation.issues.length ? "\n\nنتائج الفحص البرمجي: " + validation.issues.join(" ") : "\n\nاجتاز البرومبت الفحوص البرمجية المحددة.");
   data.agent = {
-    version: "2.0",
-    mode: "bounded-review-and-revision",
+    version: "3.0",
+    mode: "plan-tool-review-revision",
     review_mode: reviewMode,
+    plan,
+    tool_validation: validation,
     steps: trace,
     elapsed_ms: Date.now() - startedAt,
-    max_revision_passes: 1
+    max_revision_passes: maxPasses,
+    revision_passes_completed: revisionPasses
   };
   return normalizeResult(data);
 }
