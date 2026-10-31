@@ -515,14 +515,27 @@ async function tryAuto(p, action) {
   }
   if (!attempts.length) throw new Error("لم يتم إعداد أي مزوّد مؤهل للوضع المجاني. أدخل مفتاح Gemini أو مفاتيح مزودين آخرين. فعّل تأكيد الخطة المجانية لـ Groq/Cohere فقط إذا كنت متأكداً من نوع حسابك.");
   const failures = [];
-  for (const item of attempts.slice(0, 5)) {
+  const rateLimitedProviders = new Set();
+  // Try more than one provider, but never keep hammering a provider after it returns 429.
+  for (const item of attempts.slice(0, 10)) {
+    if (rateLimitedProviders.has(item.provider)) continue;
     try {
       const data = await runAgentPipeline(item.provider, item.key, item.model, p);
+      const steps = Array.isArray(data?.agent?.steps) ? data.agent.steps : [];
+      const providerWasRateLimited = steps.some(step => step.step === "provider_usage" && step.status === "rate_limited");
+      if (providerWasRateLimited) {
+        const error = "تم إنشاء مسودة جزئية، لكن المزود تجاوز حد الاستخدام أثناء مراحل التدقيق؛ لن تُعتمد النتيجة كنجاح كامل.";
+        rateLimitedProviders.add(item.provider);
+        failures.push({ provider: item.provider, model: item.model, error });
+        console.warn(JSON.stringify({ event: "promptforge_auto_provider_rate_limited_mid_pipeline", provider: item.provider, model: item.model, error }));
+        continue;
+      }
       data.routing = { mode: "auto-free", provider: item.provider, model: item.model, fallbackCount: failures.length,
         attempted: failures.map(x => ({ provider: x.provider, model: x.model, error: x.error })) };
       return data;
     } catch (e) {
       const error = String(e?.message || e).slice(0, 450);
+      if (/HTTP 429|rate limit|rate_limit|TPM|OTPM/i.test(error)) rateLimitedProviders.add(item.provider);
       failures.push({ provider: item.provider, model: item.model, error });
       console.warn(JSON.stringify({ event: "promptforge_auto_fallback", provider: item.provider, model: item.model, error }));
     }
