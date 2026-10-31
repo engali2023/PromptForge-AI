@@ -2,8 +2,16 @@ const PROVIDERS = {
   pollinations: { url: "https://gen.pollinations.ai/v1/chat/completions", kind: "openai" },
   openrouter: { url: "https://openrouter.ai/api/v1/chat/completions", kind: "openai" },
   groq: { url: "https://api.groq.com/openai/v1/chat/completions", kind: "openai" },
-  cohere: { url: "https://api.cohere.com/v2/chat", kind: "cohere" }
+  cohere: { url: "https://api.cohere.com/v2/chat", kind: "cohere" },
+  gemini: { url: "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", kind: "openai" }
 };
+// Only models listed as free on Google’s official Gemini API pricing page are eligible for auto-free routing.
+const GEMINI_FREE_MODELS = [
+  { id: "gemini-3.8-flash", name: "Gemini 3.8 Flash (Free Tier)" },
+  { id: "gemini-3-flash-preview", name: "Gemini 3 Flash Preview (Free Tier)" },
+  { id: "gemini-2.5-flash", name: "Gemini 2.5 Flash (Free Tier)" },
+  { id: "gemini-2.5-flash-lite", name: "Gemini 2.5 Flash-Lite (Free Tier)" }
+];
 let catalogCache = { at: 0, data: null };
 
 function systemPrompt() {
@@ -38,7 +46,9 @@ async function getFreeCatalog(apiKeys = {}, options = {}) {
     openrouter: [{ id: "openrouter/free", name: "OpenRouter Free Router (توجيه مجاني تلقائي)", verifiedFree: true }],
     groq: [],
     cohere: [],
+    gemini: [],
     notes: {
+      gemini: "يُعرض في الوضع التلقائي فقط نموذج Gemini الموجود في قائمة Google المجانية؛ تظل الحصة وحدود الحساب مطبقة.",
       groq: "تظهر النماذج عند إدخال مفتاح Groq؛ لا يستخدمها التوجيه التلقائي إلا بعد تأكيد أن الحساب ضمن الخطة/الحصة المجانية.",
       cohere: "تظهر النماذج عند إدخال مفتاح Cohere؛ لا يستخدمها التوجيه التلقائي إلا بعد تأكيد أن المفتاح ضمن Trial/الحصة المجانية."
     }
@@ -59,6 +69,20 @@ async function getFreeCatalog(apiKeys = {}, options = {}) {
     const list = body.data || body.models || [];
     const free = list.filter(m => isVerifiedFree(m, "openrouter")).map(m => ({ id: m.id, name: m.name || m.id, verifiedFree: true }));
     result.openrouter = [{ id: "openrouter/free", name: "OpenRouter Free Router (توجيه مجاني تلقائي)", verifiedFree: true }, ...free];
+  }
+  if (apiKeys.gemini?.trim()) {
+    try {
+      const r = await fetch("https://generativelanguage.googleapis.com/v1beta/models?key=" + encodeURIComponent(apiKeys.gemini.trim()), { headers: { Accept: "application/json" }, signal: AbortSignal.timeout(9000) });
+      if (r.ok) {
+        const body = await r.json();
+        const available = new Set((body.models || []).filter(m => Array.isArray(m.supportedGenerationMethods) && m.supportedGenerationMethods.includes("generateContent")).map(m => String(m.name || "").replace(/^models\\//, "")));
+        result.gemini = GEMINI_FREE_MODELS.filter(m => available.has(m.id)).map(m => ({ ...m, verifiedFree: true }));
+        if (!result.gemini.length) result.notes.gemini = "لم يُرجع مفتاحك أي نموذج من قائمة Gemini المجانية المعتمدة. تحقق من أهلية الخطة المجانية والموديلات المتاحة في AI Studio.";
+      } else {
+        const detail = await r.text();
+        result.notes.gemini = `تعذر جلب نماذج Gemini (HTTP ${r.status}): ${detail.slice(0, 180)}`;
+      }
+    } catch (e) { result.notes.gemini = "تعذر الوصول إلى كتالوج Gemini: " + e.message; }
   }
   if (apiKeys.groq?.trim()) {
     try {
@@ -411,6 +435,7 @@ async function tryAuto(p, action) {
   const attempts = [];
   // Interleave providers so OpenRouter's several catalog entries cannot consume the entire retry budget.
   const queues = [];
+  if (keys.gemini?.trim()) queues.push({ provider: "gemini", key: keys.gemini.trim(), models: catalog.gemini.slice(0, 4) });
   if (keys.pollinations?.trim()) queues.push({ provider: "pollinations", key: keys.pollinations.trim(), models: catalog.pollinations.slice(0, 4) });
   if (keys.openrouter?.trim()) queues.push({ provider: "openrouter", key: keys.openrouter.trim(), models: catalog.openrouter.slice(0, 5) });
   if (keys.groq?.trim() && confirmed.groq === true) queues.push({ provider: "groq", key: keys.groq.trim(), models: catalog.groq.slice(0, 5) });
@@ -424,7 +449,7 @@ async function tryAuto(p, action) {
 
   if (action === "test-auto") {
     const statuses = [];
-    for (const provider of ["pollinations", "openrouter", "groq", "cohere"]) {
+    for (const provider of ["gemini", "pollinations", "openrouter", "groq", "cohere"]) {
       const key = keys[provider]?.trim();
       if (!key) { statuses.push({ provider, ok: false, message: "لم يتم إدخال مفتاح" }); continue; }
       if ((provider === "groq" || provider === "cohere") && confirmed[provider] !== true) {
@@ -442,11 +467,11 @@ async function tryAuto(p, action) {
       if (!success) statuses.push({ provider, ok: false, message });
     }
     return { success: statuses.some(s => s.ok), statuses, catalog: {
-      pollinations: catalog.pollinations.length, openrouter: catalog.openrouter.length,
+      gemini: catalog.gemini.length, pollinations: catalog.pollinations.length, openrouter: catalog.openrouter.length,
       groq: catalog.groq.length, cohere: catalog.cohere.length
     }};
   }
-  if (!attempts.length) throw new Error("لم يتم إعداد أي مزوّد مؤهل للوضع المجاني. أدخل مفاتيح API، وفعّل تأكيد الخطة المجانية لـ Groq/Cohere فقط إذا كنت متأكداً من نوع حسابك.");
+  if (!attempts.length) throw new Error("لم يتم إعداد أي مزوّد مؤهل للوضع المجاني. أدخل مفتاح Gemini أو مفاتيح مزودين آخرين. فعّل تأكيد الخطة المجانية لـ Groq/Cohere فقط إذا كنت متأكداً من نوع حسابك.");
   const failures = [];
   for (const item of attempts.slice(0, 3)) {
     try {
