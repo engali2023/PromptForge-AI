@@ -466,6 +466,20 @@ export default async function handler(req, res) {
     data.routing = { mode: "manual", provider: p.provider, model: p.model, fallbackCount: 0, attempted: [] };
     return res.status(200).json(data);
   } catch (error) {
-    return res.status(500).json({ error: error.message || "حدث خطأ في تنفيذ الوكيل." });
+    const message = String(error?.message || "حدث خطأ غير متوقع في تنفيذ الوكيل.").slice(0, 1400);
+    const requestId = (globalThis.crypto?.randomUUID?.() || "pf-" + Date.now().toString(36));
+    const upstreamMatch = message.match(/HTTP (400|401|403|404|408|409|413|429|500|502|503|504)\\b/);
+    const status = upstreamMatch || /تعذر الاتصال بمزود|استجابة فارغة من النموذج|ليست JSON صالحًا/.test(message) ? 502 : 500;
+    console.error(JSON.stringify({
+      event: "promptforge_request_failed",
+      request_id: requestId,
+      action: req.body?.action || "generate",
+      provider: req.body?.provider || "unknown",
+      model: req.body?.model || "unknown",
+      status,
+      error_name: error?.name || "Error",
+      message
+    }));
+    return res.status(status).json({ error: message, requestId, errorType: status === 502 ? "upstream_provider_error" : "internal_error" });
   }
 }
