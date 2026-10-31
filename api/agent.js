@@ -133,7 +133,7 @@ async function callProvider(provider, key, model, sys, user, maxTokens = 1200) {
   }
   const json = JSON.parse(raw);
   const content = provider === "cohere" ? (json.message?.content || []).map(x => x.text || "").join("\n") : json.choices?.[0]?.message?.content;
-  if (typeof content !== "string" || !content.trim()) throw new Error(`${provider}: استجابة فارغة من النموذج.`);
+  if (typeof content !== "string" || !content.trim()) throw new Error(`${provider}: استجابة فارغة من النموذج (HTTP ${response.status}); تحقق من توافق النموذج مع Chat Completions أو جرّب نموذجاً آخر.`);
   return content;
 }
 function parseAgentJson(raw) {
@@ -243,8 +243,21 @@ async function runAgentPipeline(provider, key, model, p) {
 
   const generationSystem = systemPrompt() + "\n\nAGENT PLAN (follow this plan):\n" + JSON.stringify(plan) + "\n\nReturn valid JSON matching the required output schema. Preserve user constraints.";
   if (providerRateLimited) throw new Error("تجاوز مزود النموذج حد الاستخدام (HTTP 429) أثناء التخطيط؛ انتظر تجدد الحصة أو استخدم مزودًا آخر.");
-  const rawDraft = await callProvider(provider, key, model, generationSystem, base, 1500);
-  let data = normalizeResult(parseAgentJson(rawDraft));
+  let rawDraft;
+  let data;
+  try {
+    rawDraft = await callProvider(provider, key, model, generationSystem, base, 2200);
+    data = normalizeResult(parseAgentJson(rawDraft));
+  } catch (firstError) {
+    const repairSystem = "Return ONLY one complete valid JSON object matching this schema: " + JSON.stringify({ final_prompt: "complete English visual prompt", negative_prompt: "", settings: {}, rationale: "brief", scores: { Clarity: 7, Completeness: 7, "Tool Compatibility": 7, Specificity: 7, Creativity: 7 }, recommendations: [] }) + ". No markdown fences, no comments, no trailing commas. Keep strings concise and close every quote and brace.";
+    try {
+      const repairedRaw = await callProvider(provider, key, model, repairSystem, "Create the requested prompt now. User request and constraints:\n" + base.slice(0, 5000) + "\nRequired plan:\n" + JSON.stringify(plan).slice(0, 1800) + "\nPrevious response (repair only if useful):\n" + String(rawDraft || "").slice(0, 2500), 2200);
+      data = normalizeResult(parseAgentJson(repairedRaw));
+      trace.push({ step: "draft", status: "recovered", tool: "json_repair_retry", reason: String(firstError.message || firstError).slice(0, 180) });
+    } catch (repairError) {
+      throw new Error("فشل إنشاء مسودة JSON صالحة بعد محاولة الإصلاح. السبب الأول: " + String(firstError.message || firstError).slice(0, 180) + "؛ محاولة الإصلاح: " + String(repairError.message || repairError).slice(0, 180));
+    }
+  }
   trace.push({ step: "draft", status: "completed", tool: "llm_generator" });
 
   const evaluatorSystem = "You are an independent quality reviewer for image/video prompts. Evaluate the draft against the user's request and agent plan. Return ONLY valid JSON: {\"scores\":{\"Clarity\":1,\"Completeness\":1,\"Tool Compatibility\":1,\"Specificity\":1,\"Creativity\":1},\"issues\":[\"specific issue\"],\"must_improve\":true,\"evaluation_text\":\"brief explanation in requested language\"}. Scores are integers 1-10. Do not inflate scores. Do not claim that an image/video was actually generated or tested.";
