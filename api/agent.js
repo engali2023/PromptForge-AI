@@ -258,6 +258,22 @@ async function runAgentPipeline(provider, key, model, p) {
   }
 
   validation = runLocalPromptTools(data.final_prompt, p);
+
+  // Independent decision audit: compare request, plan and final prompt.
+  let decisionAudit = { status: "unavailable", summary: "تعذر إكمال التدقيق المستقل؛ الفحوص المحلية متاحة بشكل منفصل.", preserved_requirements: [], potential_violations: [], decisions_reviewed: [], uncertainty: ["لم يكتمل تدقيق النموذج المستقل."] };
+  try {
+    const auditSystem = 'You are an independent quality auditor. Compare USER REQUEST, PLAN, and FINAL PROMPT. Return ONLY valid JSON: {"status":"pass|warning|fail","summary":"string","preserved_requirements":["string"],"potential_violations":["string"],"decisions_reviewed":[{"decision":"string","evidence":"string","verdict":"supported|uncertain|conflict","reason":"string"}],"uncertainty":["string"]}. Identify omissions, contradictions, and unjustified changes. Distinguish verifiable text facts from subjective design judgments. Never claim the image was generated or visually checked.';
+    const auditUser = "USER REQUEST:\\n" + base + "\\nPLAN:\\n" + JSON.stringify(plan) + "\\nFINAL PROMPT:\\n" + String(data.final_prompt || "") + "\\nLOCAL VALIDATION:\\n" + JSON.stringify(validation);
+    const a = parseAgentJson(await callProvider(provider, key, model, auditSystem, auditUser));
+    if (!a || !Array.isArray(a.potential_violations) || !Array.isArray(a.decisions_reviewed)) throw new Error("تقرير التدقيق غير مكتمل.");
+    decisionAudit = { status: ["pass","warning","fail"].includes(a.status) ? a.status : "warning", summary: String(a.summary || "اكتمل التدقيق."), preserved_requirements: Array.isArray(a.preserved_requirements) ? a.preserved_requirements : [], potential_violations: a.potential_violations, decisions_reviewed: a.decisions_reviewed, uncertainty: Array.isArray(a.uncertainty) ? a.uncertainty : [] };
+    trace.push({ step: "decision_audit", status: decisionAudit.status === "pass" ? "completed" : "warning", tool: "independent_llm_audit", summary: decisionAudit.summary, violations: decisionAudit.potential_violations.length, decisions_reviewed: decisionAudit.decisions_reviewed.length });
+  } catch (e) {
+    decisionAudit.summary = "تعذر التدقيق المستقل: " + String(e.message || e).slice(0, 180);
+    decisionAudit.uncertainty = [decisionAudit.summary];
+    trace.push({ step: "decision_audit", status: "unavailable", tool: "independent_llm_audit", reason: String(e.message || e).slice(0, 220) });
+  }
+
   trace.push({ step: "tool_validation", status: validation.passed ? "completed" : "warning", tool: validation.tool, checks: validation.checks, issues: validation.issues });
   if (typeof data.final_prompt !== "string" || data.final_prompt.trim().length < 20) throw new Error("لم ينتج الوكيل برومبت نهائيًا صالحًا.");
   data.scores = review.scores || data.scores;
@@ -269,6 +285,7 @@ async function runAgentPipeline(provider, key, model, p) {
     review_mode: reviewMode,
     plan,
     tool_validation: validation,
+    decision_audit: decisionAudit,
     steps: trace,
     elapsed_ms: Date.now() - startedAt,
     max_revision_passes: maxPasses,
