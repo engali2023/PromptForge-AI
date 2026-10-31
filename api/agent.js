@@ -182,6 +182,8 @@ async function runAgentPipeline(provider, key, model, p) {
 
   const maxPasses = Math.max(0, Math.min(2, Number(p.maxRevisionPasses ?? 2) || 0));
   let revisionPasses = 0;
+  const revisionHistory = [];
+  const initialDraftPrompt = String(data.final_prompt || "");
   for (let pass = 1; pass <= maxPasses; pass++) {
     validation = runLocalPromptTools(data.final_prompt, p);
     const issues = [...(review.issues || []), ...validation.issues];
@@ -196,10 +198,12 @@ async function runAgentPipeline(provider, key, model, p) {
       const revised = normalizeResult(parseAgentJson(await callProvider(provider, key, model, revisionSystem, revisionUser)));
       const previousPrompt = data.final_prompt;
       if (typeof revised.final_prompt !== "string" || revised.final_prompt.trim().length < 20) throw new Error("المراجعة لم تنتج برومبت صالحًا.");
-      data = { ...data, ...revised, draft_prompt: data.draft_prompt || previousPrompt };
+      data = { ...data, ...revised, draft_prompt: data.draft_prompt || initialDraftPrompt };
       revisionPasses++;
       validation = runLocalPromptTools(data.final_prompt, p);
-      trace.push({ step: "revision", status: "completed", pass, tool: "llm_revision", changed: data.final_prompt !== previousPrompt, validation_passed: validation.passed });
+      const revisionRecord = { pass, method: "model", changed: data.final_prompt !== previousPrompt, before: previousPrompt, after: data.final_prompt, before_validation: runLocalPromptTools(previousPrompt, p), after_validation: validation, issues_addressed: issues };
+      revisionHistory.push(revisionRecord);
+      trace.push({ step: "revision", status: "completed", pass, tool: "llm_revision", changed: revisionRecord.changed, validation_passed: validation.passed, changes_summary: data.final_prompt !== previousPrompt ? "تغيّر نص البرومبت؛ راجع المقارنة لمعرفة التفاصيل." : "لم يتغير نص البرومبت." });
       review = { ...review, must_improve: !validation.passed, issues: validation.issues };
     } catch (e) {
       const revisionError = String(e.message || e).slice(0, 220);
@@ -215,7 +219,8 @@ async function runAgentPipeline(provider, key, model, p) {
           data.final_prompt = retryPrompt.trim();
           revisionPasses++;
           validation = runLocalPromptTools(data.final_prompt, p);
-          trace.push({ step: "revision", status: "completed_retry", pass, tool: "llm_revision_retry", changed: data.final_prompt !== previousPrompt, validation_passed: validation.passed, first_error: revisionError });
+          revisionHistory.push({ pass, method: "model_retry", changed: data.final_prompt !== previousPrompt, before: previousPrompt, after: data.final_prompt, before_validation: runLocalPromptTools(previousPrompt, p), after_validation: validation, issues_addressed: issues });
+          trace.push({ step: "revision", status: "completed_retry", pass, tool: "llm_revision_retry", changed: data.final_prompt !== previousPrompt, validation_passed: validation.passed, changes_summary: data.final_prompt !== previousPrompt ? "تغيّر نص البرومبت بعد إعادة المحاولة." : "لم يتغير نص البرومبت بعد إعادة المحاولة.", first_error: revisionError });
           review = { ...review, must_improve: !validation.passed, issues: validation.issues };
           retrySucceeded = true;
         } else {
@@ -242,7 +247,8 @@ async function runAgentPipeline(provider, key, model, p) {
         data.final_prompt = repairedPrompt;
         validation = runLocalPromptTools(data.final_prompt, p);
         revisionPasses++;
-        trace.push({ step: "revision", status: "completed_fallback", pass, tool: "deterministic_repair", changed: true, repairs, model_error: String(e.message || e).slice(0, 220), validation_passed: validation.passed });
+        revisionHistory.push({ pass, method: "deterministic_fallback", changed: true, before: previousPrompt, after: data.final_prompt, before_validation: runLocalPromptTools(previousPrompt, p), after_validation: validation, changes_summary: repairs.join("، "), issues_addressed: issues });
+        trace.push({ step: "revision", status: "completed_fallback", pass, tool: "deterministic_repair", changed: true, repairs, changes_summary: repairs.join("، "), model_error: String(e.message || e).slice(0, 220), validation_passed: validation.passed });
         review = { ...review, must_improve: !validation.passed, issues: validation.issues };
       } else {
         trace.push({ step: "revision", status: "failed", pass, tool: "llm_revision", reason: String(e.message || e).slice(0, 220), fallback: "لم تُجرَ تعديلات آلية لأن الإصلاح الآمن لم يكن واضحًا." });
@@ -266,7 +272,9 @@ async function runAgentPipeline(provider, key, model, p) {
     steps: trace,
     elapsed_ms: Date.now() - startedAt,
     max_revision_passes: maxPasses,
-    revision_passes_completed: revisionPasses
+    revision_passes_completed: revisionPasses,
+    initial_draft_prompt: initialDraftPrompt,
+    revision_history: revisionHistory
   };
   return normalizeResult(data);
 }
