@@ -409,10 +409,18 @@ async function tryAuto(p, action) {
   const confirmed = p.freeTierConfirmed || {};
   const catalog = await getFreeCatalog(keys, { force: true });
   const attempts = [];
-  if (keys.pollinations?.trim()) for (const m of catalog.pollinations.slice(0, 4)) attempts.push({ provider: "pollinations", key: keys.pollinations.trim(), model: m.id });
-  if (keys.openrouter?.trim()) for (const m of catalog.openrouter.slice(0, 5)) attempts.push({ provider: "openrouter", key: keys.openrouter.trim(), model: m.id });
-  if (keys.groq?.trim() && confirmed.groq === true) for (const m of catalog.groq.slice(0, 5)) attempts.push({ provider: "groq", key: keys.groq.trim(), model: m.id });
-  if (keys.cohere?.trim() && confirmed.cohere === true) for (const m of catalog.cohere.slice(0, 5)) attempts.push({ provider: "cohere", key: keys.cohere.trim(), model: m.id });
+  // Interleave providers so OpenRouter's several catalog entries cannot consume the entire retry budget.
+  const queues = [];
+  if (keys.pollinations?.trim()) queues.push({ provider: "pollinations", key: keys.pollinations.trim(), models: catalog.pollinations.slice(0, 4) });
+  if (keys.openrouter?.trim()) queues.push({ provider: "openrouter", key: keys.openrouter.trim(), models: catalog.openrouter.slice(0, 5) });
+  if (keys.groq?.trim() && confirmed.groq === true) queues.push({ provider: "groq", key: keys.groq.trim(), models: catalog.groq.slice(0, 5) });
+  if (keys.cohere?.trim() && confirmed.cohere === true) queues.push({ provider: "cohere", key: keys.cohere.trim(), models: catalog.cohere.slice(0, 5) });
+  for (let round = 0; round < 5; round++) {
+    for (const queue of queues) {
+      const model = queue.models[round];
+      if (model) attempts.push({ provider: queue.provider, key: queue.key, model: model.id });
+    }
+  }
 
   if (action === "test-auto") {
     const statuses = [];
@@ -446,9 +454,20 @@ async function tryAuto(p, action) {
       data.routing = { mode: "auto-free", provider: item.provider, model: item.model, fallbackCount: failures.length,
         attempted: failures.map(x => ({ provider: x.provider, model: x.model, error: x.error })) };
       return data;
-    } catch (e) { failures.push({ provider: item.provider, model: item.model, error: e.message }); }
+    } catch (e) {
+      const error = String(e?.message || e).slice(0, 450);
+      failures.push({ provider: item.provider, model: item.model, error });
+      console.warn(JSON.stringify({ event: "promptforge_auto_fallback", provider: item.provider, model: item.model, error }));
+    }
   }
-  throw new Error("تعذّر تنفيذ الطلب عبر النماذج المجانية/المؤكدة التي تمت تجربتها (بحد أقصى 3 نماذج لتقليل الانتظار). " + failures.map(f => `${f.provider}/${f.model}: ${f.error}`).join(" | ").slice(0, 1400));
+  const rateLimited = failures.some(f => /HTTP 429|rate limit|rate_limit|TPM/i.test(f.error));
+  const unavailable = failures.some(f => /HTTP 503|HTTP 502|timeout|timed out|aborted/i.test(f.error));
+  const headline = rateLimited
+    ? "تجاوز أحد مزودي النماذج حد الاستخدام (429). جرّب بعد تجدد الحصة أو استخدم مزودًا آخر."
+    : unavailable
+      ? "النماذج المجانية التي جُرّبت غير متاحة مؤقتًا (مهلة/503). جرّب لاحقًا أو أضف مزودًا بديلًا."
+      : "تعذر تنفيذ الطلب عبر النماذج المؤهلة؛ راجع تفاصيل المزود أدناه.";
+  throw new Error(headline + " " + failures.map(f => `${f.provider}/${f.model}: ${f.error}`).join(" | ").slice(0, 1400));
 }
 export default async function handler(req, res) {
   res.setHeader("Cache-Control", "no-store");
