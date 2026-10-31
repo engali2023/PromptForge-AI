@@ -130,12 +130,24 @@ async function callProvider(provider, key, model, sys, user, maxTokens = 1200) {
   return content;
 }
 function parseAgentJson(raw) {
-  try { return JSON.parse(raw); } catch {
-    const match = raw.match(/\{[\s\S]*\}/);
-    if (!match) throw new Error("النموذج لم يرجع JSON صالحاً؛ سيتم تجربة نموذج آخر في الوضع التلقائي.");
-    return JSON.parse(match[0]);
+  if (raw && typeof raw === "object") return raw;
+  const source = String(raw || "").replace(/^\\uFEFF/, "").trim();
+  const candidates = [source];
+  const fenced = source.match(/```(?:json)?\\s*([\\s\\S]*?)\\s*```/i);
+  if (fenced) candidates.push(fenced[1].trim());
+  const first = source.indexOf("{");
+  const last = source.lastIndexOf("}");
+  if (first >= 0 && last > first) candidates.push(source.slice(first, last + 1));
+  let lastError;
+  for (const candidate of [...new Set(candidates)]) {
+    try { return JSON.parse(candidate); } catch (e) { lastError = e; }
+    const cleaned = candidate.replace(/,\\s*([}\\]])/g, "$1");
+    try { return JSON.parse(cleaned); } catch (e) { lastError = e; }
   }
+  const detail = lastError && lastError.message ? lastError.message : "صيغة غير معروفة";
+  throw new Error("تعذر تحليل JSON من النموذج: " + detail + ". أعد المحاولة أو استخدم مزودًا آخر.");
 }
+
 function normalizeResult(data) {
   const keys = ["Clarity", "Completeness", "Tool Compatibility", "Specificity", "Creativity"];
   data.scores = data.scores || {};
