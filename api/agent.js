@@ -93,7 +93,7 @@ async function callProvider(provider, key, model, sys, user) {
   let body;
   if (provider === "cohere") body = { model, messages: [{ role: "system", content: sys }, { role: "user", content: user }], temperature: 0.6, max_tokens: 3500 };
   else body = { model, messages: [{ role: "system", content: sys }, { role: "user", content: user }], temperature: 0.6, max_tokens: 3500, stream: false };
-  const response = await fetch(cfg.url, { method: "POST", headers, body: JSON.stringify(body), signal: AbortSignal.timeout(12000) });
+  const response = await fetch(cfg.url, { method: "POST", headers, body: JSON.stringify(body), signal: AbortSignal.timeout(9000) });
   const raw = await response.text();
   if (!response.ok) {
     let detail = raw.slice(0, 350);
@@ -210,7 +210,7 @@ async function tryAuto(p, action) {
   }
   if (!attempts.length) throw new Error("لم يتم إعداد أي مزوّد مؤهل للوضع المجاني. أدخل مفاتيح API، وفعّل تأكيد الخطة المجانية لـ Groq/Cohere فقط إذا كنت متأكداً من نوع حسابك.");
   const failures = [];
-  for (const item of attempts) {
+  for (const item of attempts.slice(0, 3)) {
     try {
       const data = await runAgentPipeline(item.provider, item.key, item.model, p);
       data.routing = { mode: "auto-free", provider: item.provider, model: item.model, fallbackCount: failures.length,
@@ -218,7 +218,7 @@ async function tryAuto(p, action) {
       return data;
     } catch (e) { failures.push({ provider: item.provider, model: item.model, error: e.message }); }
   }
-  throw new Error("تعذّر تنفيذ الطلب عبر جميع النماذج المجانية/المؤكدة المتاحة. " + failures.map(f => `${f.provider}/${f.model}: ${f.error}`).join(" | ").slice(0, 1400));
+  throw new Error("تعذّر تنفيذ الطلب عبر النماذج المجانية/المؤكدة التي تمت تجربتها (بحد أقصى 3 نماذج لتقليل الانتظار). " + failures.map(f => `${f.provider}/${f.model}: ${f.error}`).join(" | ").slice(0, 1400));
 }
 export default async function handler(req, res) {
   res.setHeader("Cache-Control", "no-store");
