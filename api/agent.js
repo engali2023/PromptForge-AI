@@ -72,7 +72,7 @@ async function getFreeCatalog(apiKeys = {}, options = {}) {
   }
   if (apiKeys.gemini?.trim()) {
     try {
-      const r = await fetch("https://generativelanguage.googleapis.com/v1beta/models?key=" + encodeURIComponent(apiKeys.gemini.trim()), { headers: { Accept: "application/json" }, signal: AbortSignal.timeout(9000) });
+      const r = await fetch("https://generativelanguage.googleapis.com/v1beta/models", { headers: { Accept: "application/json", "x-goog-api-key": apiKeys.gemini.trim() }, signal: AbortSignal.timeout(9000) });
       if (r.ok) {
         const body = await r.json();
         const available = new Set((body.models || []).filter(m => Array.isArray(m.supportedGenerationMethods) && m.supportedGenerationMethods.includes("generateContent")).map(m => String(m.name || "").replace(/^models\\//, "")));
