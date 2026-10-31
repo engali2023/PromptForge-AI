@@ -116,8 +116,8 @@ async function callProvider(provider, key, model, sys, user, maxTokens = 1200) {
   if (provider === "openrouter") { headers["HTTP-Referer"] = process.env.APP_URL || "https://vercel.app"; headers["X-Title"] = "PromptForge AI"; }
   let body;
   if (provider === "cohere") body = { model, messages: [{ role: "system", content: sys }, { role: "user", content: user }], temperature: 0.6, max_tokens: maxTokens };
-  else body = { model, messages: [{ role: "system", content: sys }, { role: "user", content: user }], temperature: 0.6, max_tokens: maxTokens, stream: false, ...(provider === "gemini" ? { response_format: { type: "json_object" } } : {}) };
-  const response = await fetch(cfg.url, { method: "POST", headers, body: JSON.stringify(body), signal: AbortSignal.timeout(9000) });
+  else body = { model, messages: [{ role: "system", content: sys }, { role: "user", content: user }], temperature: 0.4, max_tokens: Math.max(maxTokens, provider === "gemini" ? 2200 : maxTokens), stream: false, ...(provider === "gemini" ? { response_format: { type: "json_object" }, reasoning_effort: "minimal" } : {}) };
+  const response = await fetch(cfg.url, { method: "POST", headers, body: JSON.stringify(body), signal: AbortSignal.timeout(18000) });
   const raw = await response.text();
   if (!response.ok) {
     let detail = raw.slice(0, 350);
@@ -145,7 +145,7 @@ function parseAgentJson(raw) {
   let lastError;
   for (const candidate of [...new Set(candidates)]) {
     try { return JSON.parse(candidate); } catch (e) { lastError = e; }
-    const cleaned = candidate.replace(/,\\s*([}\\]])/g, "$1");
+    const cleaned = candidate.replace(/,\s*([}\]])/g, "$1");
     try { return JSON.parse(cleaned); } catch (e) { lastError = e; }
   }
   const detail = lastError && lastError.message ? lastError.message : "صيغة غير معروفة";
@@ -174,12 +174,12 @@ function auditFinalPrompt(prompt, p, plan) {
   }
   const target = String(p.target || "");
   if (/midjourney/i.test(target)) {
-    add("midjourney_invalid_style_parameter", !/--style\\s+cinematic\\b/i.test(text), "معامل --style cinematic قد لا يكون صالحًا؛ اجعل cinematic وصفًا نصيًا.", "فحص صيغة معامل Midjourney.");
+    add("midjourney_invalid_style_parameter", !/--style\s+cinematic\b/i.test(text), "معامل --style cinematic قد لا يكون صالحًا؛ اجعل cinematic وصفًا نصيًا.", "فحص صيغة معامل Midjourney.");
   }
   const required = Array.isArray(plan?.required_elements) ? plan.required_elements : [];
   const requirementResults = required.slice(0, 15).map((item) => {
     const phrase = String(item || "").trim();
-    const words = phrase.toLowerCase().split(/[^a-z0-9\\u0600-\\u06ff]+/).filter(w => w.length >= 4);
+    const words = phrase.toLowerCase().split(/[^a-z0-9\u0600-\u06ff]+/).filter(w => w.length >= 4);
     const matchedWords = words.filter(w => lower.includes(w));
     const ratioMatched = words.length ? matchedWords.length / words.length : lower.includes(phrase.toLowerCase());
     const ok = ratioMatched >= 0.5 || lower.includes(phrase.toLowerCase());
@@ -540,7 +540,7 @@ export default async function handler(req, res) {
   } catch (error) {
     const message = String(error?.message || "حدث خطأ غير متوقع في تنفيذ الوكيل.").slice(0, 1400);
     const requestId = (globalThis.crypto?.randomUUID?.() || "pf-" + Date.now().toString(36));
-    const upstreamMatch = message.match(/HTTP (400|401|403|404|408|409|413|429|500|502|503|504)\\b/);
+    const upstreamMatch = message.match(/HTTP (400|401|403|404|408|409|413|429|500|502|503|504)\b/);
     const status = upstreamMatch || /تعذر الاتصال بمزود|استجابة فارغة من النموذج|ليست JSON صالحًا/.test(message) ? 502 : 500;
     console.error(JSON.stringify({
       event: "promptforge_request_failed",
