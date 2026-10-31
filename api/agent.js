@@ -128,7 +128,7 @@ function runLocalPromptTools(prompt, p) {
   checks.push({ name: "non_empty_prompt", ok: text.trim().length >= 20, message: "البرومبت النهائي فارغ أو قصير جدًا." });
   checks.push({ name: "visual_specificity", ok: /lighting|composition|texture|camera|background|material|color|mood|lens|subject/i.test(text), message: "أضف تفاصيل بصرية مثل الإضاءة والتكوين والخامات." });
   if (ratio) {
-    const ratioMentioned = text.includes(ratio) || new RegExp("--ar\\s+" + ratio.replace(":", "\\s*:\\s*")).test(text) || /aspect ratio/i.test(text);
+    const ratioMentioned = text.includes(ratio) || new RegExp("--ar\s+" + ratio.replace(":", "\s*:\s*")).test(text) || /aspect ratio/i.test(text);
     checks.push({ name: "aspect_ratio", ok: ratioMentioned, message: "تحقق من تضمين نسبة الأبعاد المطلوبة: " + ratio });
   }
   if (/midjourney/i.test(target)) {
@@ -206,12 +206,12 @@ async function runAgentPipeline(provider, key, model, p) {
       const previousPrompt = String(data.final_prompt || "");
       let repairedPrompt = previousPrompt;
       const repairs = [];
-      if (/midjourney/i.test(String(p.target || "")) && /--style\\s+cinematic\\b/i.test(repairedPrompt)) {
-        repairedPrompt = repairedPrompt.replace(/--style\\s+cinematic\\b/ig, "cinematic");
+      if (/midjourney/i.test(String(p.target || "")) && /--style\s+cinematic\b/i.test(repairedPrompt)) {
+        repairedPrompt = repairedPrompt.replace(/--style\s+cinematic\b/ig, "cinematic");
         repairs.push("استبدال معامل --style cinematic بوصف نصي");
       }
       const ratio = String(p.ratio || "");
-      if (ratio && !repairedPrompt.includes(ratio) && !/--ar\\s+\\d+:\\d+|aspect ratio/i.test(repairedPrompt)) {
+      if (ratio && !repairedPrompt.includes(ratio) && !/--ar\s+\d+:\d+|aspect ratio/i.test(repairedPrompt)) {
         repairedPrompt += /midjourney/i.test(String(p.target || "")) ? " --ar " + ratio : " Aspect ratio " + ratio + ".";
         repairs.push("إضافة نسبة الأبعاد المطلوبة");
       }
