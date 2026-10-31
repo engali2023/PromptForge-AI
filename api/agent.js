@@ -266,8 +266,30 @@ async function runAgentPipeline(provider, key, model, p) {
     const auditUser = "USER REQUEST:\n" + base + "\nPLAN:\n" + JSON.stringify(plan) + "\nFINAL PROMPT:\n" + String(data.final_prompt || "") + "\nLOCAL VALIDATION:\n" + JSON.stringify(validation);
     const a = parseAgentJson(await callProvider(provider, key, model, auditSystem, auditUser));
     if (!a || !Array.isArray(a.potential_violations) || !Array.isArray(a.decisions_reviewed)) throw new Error("تقرير التدقيق غير مكتمل.");
-    decisionAudit = { status: ["pass","warning","fail"].includes(a.status) ? a.status : "warning", summary: String(a.summary || "اكتمل التدقيق."), preserved_requirements: Array.isArray(a.preserved_requirements) ? a.preserved_requirements : [], potential_violations: a.potential_violations, decisions_reviewed: a.decisions_reviewed, uncertainty: Array.isArray(a.uncertainty) ? a.uncertainty : [] };
-    trace.push({ step: "decision_audit", status: decisionAudit.status === "pass" ? "completed" : "warning", tool: "independent_llm_audit", summary: decisionAudit.summary, violations: decisionAudit.potential_violations.length, decisions_reviewed: decisionAudit.decisions_reviewed.length });
+    const normalizedDecisions = a.decisions_reviewed.filter(x => x && typeof x === "object").map(x => ({
+      decision: String(x.decision || "قرار غير مسمى"),
+      evidence: String(x.evidence || "لم يقدم المدقق دليلًا واضحًا."),
+      verdict: ["supported","uncertain","conflict"].includes(x.verdict) ? x.verdict : "uncertain",
+      reason: String(x.reason || "لم يقدم المدقق تفسيرًا كافيًا.")
+    }));
+    const normalizedViolations = a.potential_violations.filter(x => typeof x === "string" && x.trim()).map(x => x.trim());
+    const normalizedUncertainty = Array.isArray(a.uncertainty) ? a.uncertainty.filter(x => typeof x === "string" && x.trim()) : [];
+    const unsupportedDecisions = normalizedDecisions.filter(x => x.verdict !== "supported");
+    let auditedStatus = ["pass","warning","fail"].includes(a.status) ? a.status : "warning";
+    // Never allow a model to report PASS while listing conflicts, uncertainty, or missing decision evidence.
+    if (normalizedViolations.length || normalizedUncertainty.length || unsupportedDecisions.length) {
+      if (auditedStatus === "pass") auditedStatus = normalizedDecisions.some(x => x.verdict === "conflict") ? "fail" : "warning";
+    }
+    if (!normalizedDecisions.length && auditedStatus === "pass") auditedStatus = "warning";
+    decisionAudit = {
+      status: auditedStatus,
+      summary: String(a.summary || "اكتمل التدقيق.") + (auditedStatus !== a.status ? " تم خفض الحالة تلقائيًا بسبب وجود مخالفات أو قرارات غير محسومة." : ""),
+      preserved_requirements: Array.isArray(a.preserved_requirements) ? a.preserved_requirements.filter(x => typeof x === "string") : [],
+      potential_violations: normalizedViolations,
+      decisions_reviewed: normalizedDecisions,
+      uncertainty: normalizedUncertainty
+    };
+    trace.push({ step: "decision_audit", status: decisionAudit.status === "pass" ? "completed" : decisionAudit.status === "fail" ? "failed" : "warning", tool: "independent_llm_audit", summary: decisionAudit.summary, violations: decisionAudit.potential_violations.length, decisions_reviewed: decisionAudit.decisions_reviewed.length, unresolved_decisions: unsupportedDecisions.length });
   } catch (e) {
     // Honest deterministic fallback: concrete local evidence, never label it an independent model audit.
     const promptText = String(data.final_prompt || "").toLowerCase();
