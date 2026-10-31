@@ -178,6 +178,8 @@ function runLocalPromptTools(prompt, p) {
 
 async function runAgentPipeline(provider, key, model, p) {
   const trace = [];
+  let providerRateLimited = false;
+  const isRateLimitError = error => /HTTP 429|rate limit|rate_limit|tokens per minute|TPM/i.test(String(error?.message || error || ""));
   const startedAt = Date.now();
   const base = userPrompt(p);
   const planSystem = "You are the planning component of PromptForge. Convert the user's creative request into a concise actionable plan. Return ONLY valid JSON: {\"goal\":\"...\",\"required_elements\":[\"...\"],\"visual_strategy\":\"...\",\"tool_constraints\":[\"...\"],\"validation_criteria\":[\"...\"],\"risks_or_unknowns\":[\"...\"]}. Do not write the final prompt yet. Explanations must use the requested language.";
@@ -187,11 +189,13 @@ async function runAgentPipeline(provider, key, model, p) {
     if (!plan || !Array.isArray(plan.required_elements) || !Array.isArray(plan.validation_criteria)) throw new Error("خطة غير مكتملة");
     trace.push({ step: "planning", status: "completed", tool: "llm_planner", details: plan });
   } catch (e) {
+    providerRateLimited = isRateLimitError(e);
     plan = { goal: p.idea, required_elements: [], visual_strategy: "Use the user idea and explicit settings to build a clear, tool-compatible visual prompt. Semantic requirements were not independently decomposed because planning failed.", tool_constraints: [String(p.target || ""), String(p.ratio || "")].filter(Boolean), validation_criteria: ["non-empty", "specific", "tool-compatible", "preserve explicit user constraints"], risks_or_unknowns: ["The planning model did not return a valid plan; semantic requirement auditing is limited."] };
     trace.push({ step: "planning", status: "fallback", tool: "basic_plan", reason: String(e.message || e).slice(0, 180) });
   }
 
   const generationSystem = systemPrompt() + "\n\nAGENT PLAN (follow this plan):\n" + JSON.stringify(plan) + "\n\nReturn valid JSON matching the required output schema. Preserve user constraints.";
+  if (providerRateLimited) throw new Error("Groq أو مزود النموذج تجاوز حد TPM (HTTP 429) أثناء التخطيط؛ اختر مزودًا آخر أو انتظر تجدد الحصة.");
   const rawDraft = await callProvider(provider, key, model, generationSystem, base, 1500);
   let data = normalizeResult(parseAgentJson(rawDraft));
   trace.push({ step: "draft", status: "completed", tool: "llm_generator" });
@@ -201,6 +205,7 @@ async function runAgentPipeline(provider, key, model, p) {
   let reviewMode = "model";
   let validation = runLocalPromptTools(data.final_prompt, p);
   try {
+    if (providerRateLimited) throw new Error("تم تخطي المراجعة لأن المزود تجاوز حد TPM في مرحلة سابقة (HTTP 429).");
     review = parseAgentJson(await callProvider(provider, key, model, evaluatorSystem, "USER REQUIREMENTS:\n" + base.slice(0, 4500) + "\nPLAN:\n" + JSON.stringify(plan).slice(0, 2500) + "\nDRAFT PROMPT:\n" + String(data.final_prompt || "").slice(0, 5000), 650));
     const required = ["Clarity", "Completeness", "Tool Compatibility", "Specificity", "Creativity"];
     if (!review.scores || required.some(k => !Number.isFinite(Number(review.scores[k])))) throw new Error("مراجعة النموذج لم تتضمن درجات صالحة.");
@@ -209,6 +214,7 @@ async function runAgentPipeline(provider, key, model, p) {
     review.must_improve = review.must_improve === true || review.issues.length > 0;
     trace.push({ step: "independent_review", status: "completed", tool: "llm_reviewer", score: Number((required.reduce((s,k)=>s+review.scores[k],0)/required.length).toFixed(1)), issues_count: review.issues.length });
   } catch (e) {
+    providerRateLimited = providerRateLimited || isRateLimitError(e);
     reviewMode = "fallback";
     const issues = validation.issues.slice();
     review = { scores: { Clarity: 6, Completeness: 6, "Tool Compatibility": validation.passed ? 7 : 4, Specificity: validation.passed ? 7 : 5, Creativity: 6 }, issues, must_improve: issues.length > 0, evaluation_text: "تعذرت المراجعة المستقلة بواسطة النموذج؛ تم استخدام فحص برمجي محدود فقط." };
@@ -230,6 +236,7 @@ async function runAgentPipeline(provider, key, model, p) {
     const revisionSystem = "You are the revision component of a prompt-engineering agent. Fix the supplied issues using the user request, agent plan, and tool-validation report. Preserve all required constraints. Do not claim to have generated or tested media. Return ONLY valid JSON using the standard PromptForge result schema.";
     const revisionUser = "USER REQUEST:\n" + base + "\nPLAN:\n" + JSON.stringify(plan) + "\nCURRENT RESULT:\n" + JSON.stringify(data) + "\nREVIEW ISSUES:\n" + JSON.stringify(issues) + "\nLOCAL TOOL VALIDATION:\n" + JSON.stringify(validation) + "\nRevise pass " + pass + " of " + maxPasses + ".";
     try {
+      if (providerRateLimited) throw new Error("تم إيقاف التحسين بالنموذج بعد بلوغ حد TPM (HTTP 429)؛ سيُستخدم الإصلاح المحلي الآمن فقط.");
       const revised = normalizeResult(parseAgentJson(await callProvider(provider, key, model, revisionSystem, revisionUser.slice(0, 9000), 1000)));
       const previousPrompt = data.final_prompt;
       if (typeof revised.final_prompt !== "string" || revised.final_prompt.trim().length < 20) throw new Error("المراجعة لم تنتج برومبت صالحًا.");
@@ -244,7 +251,8 @@ async function runAgentPipeline(provider, key, model, p) {
       const revisionError = String(e.message || e).slice(0, 220);
       // Avoid repeating the same request immediately after a rate-limit response.
       let retrySucceeded = false;
-      const rateLimited = /HTTP 429|rate limit|rate_limit|tokens per minute|TPM/i.test(revisionError);
+      const rateLimited = isRateLimitError(revisionError);
+      providerRateLimited = providerRateLimited || rateLimited;
       try {
         if (rateLimited) throw new Error("تجاوز حد الاستخدام 429؛ تم إيقاف إعادة المحاولة لتجنب استهلاك الحصة، وسيُستخدم الإصلاح المحلي الآمن إن أمكن.");
         const retrySystem = "Edit the prompt only. Return ONLY JSON with one property: final_prompt (string). Preserve the user's requirements. Do not explain.";
@@ -299,6 +307,7 @@ async function runAgentPipeline(provider, key, model, p) {
   // Independent decision audit: compare request, plan and final prompt.
   let decisionAudit = { status: "unavailable", summary: "تعذر إكمال التدقيق المستقل؛ الفحوص المحلية متاحة بشكل منفصل.", preserved_requirements: [], potential_violations: [], decisions_reviewed: [], uncertainty: ["لم يكتمل تدقيق النموذج المستقل."] };
   try {
+    if (providerRateLimited) throw new Error("تم تخطي التدقيق بالنموذج بسبب بلوغ حد TPM (HTTP 429). الفحص المحلي ليس تدقيقًا مستقلًا.");
     const auditSystem = 'You are an independent quality auditor. Compare USER REQUEST, PLAN, and FINAL PROMPT. Return ONLY valid JSON: {"status":"pass|warning|fail","summary":"string","preserved_requirements":["string"],"potential_violations":["string"],"decisions_reviewed":[{"decision":"string","evidence":"string","verdict":"supported|uncertain|conflict","reason":"string"}],"uncertainty":["string"]}. Identify omissions, contradictions, and unjustified changes. Distinguish verifiable text facts from subjective design judgments. Never claim the image was generated or visually checked.';
     const auditUser = "USER REQUEST:\n" + base + "\nPLAN:\n" + JSON.stringify(plan) + "\nFINAL PROMPT:\n" + String(data.final_prompt || "") + "\nLOCAL VALIDATION:\n" + JSON.stringify(validation);
     const a = parseAgentJson(await callProvider(provider, key, model, auditSystem, ("USER REQUEST:\n" + base.slice(0, 3500) + "\nPLAN:\n" + JSON.stringify(plan).slice(0, 1800) + "\nFINAL PROMPT:\n" + String(data.final_prompt || "").slice(0, 4500) + "\nLOCAL VALIDATION:\n" + JSON.stringify(validation).slice(0, 1200)), 650));
@@ -328,6 +337,7 @@ async function runAgentPipeline(provider, key, model, p) {
     };
     trace.push({ step: "decision_audit", status: decisionAudit.status === "pass" ? "completed" : decisionAudit.status === "fail" ? "failed" : "warning", tool: "independent_llm_audit", summary: decisionAudit.summary, violations: decisionAudit.potential_violations.length, decisions_reviewed: decisionAudit.decisions_reviewed.length, unresolved_decisions: unsupportedDecisions.length });
   } catch (e) {
+    providerRateLimited = providerRateLimited || isRateLimitError(e);
     // Honest deterministic fallback: concrete local evidence, never label it an independent model audit.
     const promptText = String(data.final_prompt || "").toLowerCase();
     const localDecisions = [];
