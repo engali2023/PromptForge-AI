@@ -89,7 +89,7 @@ async function getFreeCatalog(apiKeys = {}, options = {}) {
         const body = await r.json();
         // Exclude models known from runtime errors to require manual terms acceptance,
         // return malformed JSON frequently, or be unusable under the observed tiny output-token quota.
-        const excludedGroq = /whisper|guard|embed|tts|speech|audio|canopylabs\/orpheus-arabic-saudi|allam-2-7b|qwen\/qwen3\.8-27b/i;
+        const excludedGroq = /whisper|guard|embed|tts|speech|audio|canopylabs\/orpheus[^/]*|allam-2-7b|qwen\/qwen3\.8-27b/i;
         result.groq = (body.data || []).filter(m => m.id && !excludedGroq.test(m.id) && !/deprecated|preview/i.test(String(m.id)))
           .map(m => ({ id: m.id, name: m.id, requiresFreeTierConfirmation: true }))
           .sort((a, b) => {
