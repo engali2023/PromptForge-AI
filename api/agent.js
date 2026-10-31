@@ -116,7 +116,7 @@ async function callProvider(provider, key, model, sys, user, maxTokens = 1200) {
   if (provider === "openrouter") { headers["HTTP-Referer"] = process.env.APP_URL || "https://vercel.app"; headers["X-Title"] = "PromptForge AI"; }
   let body;
   if (provider === "cohere") body = { model, messages: [{ role: "system", content: sys }, { role: "user", content: user }], temperature: 0.6, max_tokens: maxTokens };
-  else body = { model, messages: [{ role: "system", content: sys }, { role: "user", content: user }], temperature: 0.6, max_tokens: maxTokens, stream: false };
+  else body = { model, messages: [{ role: "system", content: sys }, { role: "user", content: user }], temperature: 0.6, max_tokens: maxTokens, stream: false, ...(provider === "gemini" ? { response_format: { type: "json_object" } } : {}) };
   const response = await fetch(cfg.url, { method: "POST", headers, body: JSON.stringify(body), signal: AbortSignal.timeout(9000) });
   const raw = await response.text();
   if (!response.ok) {
